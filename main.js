@@ -33,89 +33,172 @@
   const LIC_STORAGE_KEY = "qte_license_key";
   const HWID_STORAGE_KEY = "qte_device_hwid";
   const LIC_INFO_STORAGE = "qte_license_info";
+  const SERVER_URL_STORAGE = "qte_server_url";
 
-  // Production and fallback Cloud Server origins
-  const CLOUD_PROD_SERVERS = [
-    "https://ais-pre-gdlcsfnefccf4ctpdxdyhe-878201435123.asia-southeast1.run.app",
-    "https://ais-dev-gdlcsfnefccf4ctpdxdyhe-878201435123.asia-southeast1.run.app"
-  ];
+  // Dynamic server candidates resolution (never blocks with stale/unreachable dev servers)
+  function getServerCandidateOrigins() {
+    const list = [];
 
-  // Robust multi-origin API caller (never fails with false network errors on Quotex)
-  async function callServerEndpoint(endpointPath, method, payload) {
-    const candidateOrigins = [];
-
-    // 1. Injected at serve-time by server.ts
-    const injected = "http://ais-dev-gdlcsfnefccf4ctpdxdyhe-878201435123.asia-southeast1.run.app";
-    if (injected && !injected.includes("PLACEHOLDER") && injected.startsWith("http")) {
-      candidateOrigins.push(injected);
+    function addOrigin(raw) {
+      if (!raw || typeof raw !== "string") return;
+      try {
+        let u = raw.trim().replace(/\/+$/, "");
+        if (!u) return;
+        if (!u.startsWith("http://") && !u.startsWith("https://")) {
+          if (u.startsWith("/")) return;
+          u = (location.protocol === "http:" ? "http://" : "https://") + u;
+        }
+        const parsed = new URL(u);
+        const origin = parsed.origin;
+        const host = parsed.hostname.toLowerCase();
+        // Ignore trading platform hostnames
+        if (
+          host.includes("market-qx") ||
+          host.includes("quotex") ||
+          host.includes("qxbroker") ||
+          host.includes("qx.io") ||
+          host.includes("qx-trade")
+        ) {
+          return;
+        }
+        if (!list.includes(origin)) list.push(origin);
+      } catch (_) {}
     }
 
-    // 2. Global variable if defined by loader
-    if (window.__QUOTEX_TE_SERVER__ && typeof window.__QUOTEX_TE_SERVER__ === "string") {
-      candidateOrigins.push(window.__QUOTEX_TE_SERVER__);
-    }
+    // 1. Manually configured server URL (localStorage or global variable)
+    try {
+      const stored = localStorage.getItem(SERVER_URL_STORAGE);
+      if (stored) addOrigin(stored);
+    } catch (_) {}
+    if (window.__QUOTEX_TE_SERVER__) addOrigin(window.__QUOTEX_TE_SERVER__);
+
+    // 2. Current executing script tag (document.currentScript) — exact host serving quotex-te.js
+    try {
+      if (document.currentScript && document.currentScript.src) {
+        addOrigin(new URL(document.currentScript.src).origin);
+      }
+    } catch (_) {}
 
     // 3. Inspect scripts in DOM
     try {
       const scripts = document.querySelectorAll("script");
       for (let i = 0; i < scripts.length; i++) {
         const src = scripts[i].src || "";
-        if (src.includes("quotex-te.js") || src.includes("thunderx")) {
-          const u = new URL(src);
-          if (!u.origin.includes("market-qx") && !u.origin.includes("quotex") && !u.origin.includes("qxbroker")) {
-            if (!candidateOrigins.includes(u.origin)) candidateOrigins.push(u.origin);
-          }
+        if (src && (src.includes("quotex-te.js") || src.includes("thunderx") || src.includes("secondbot"))) {
+          addOrigin(new URL(src).origin);
         }
       }
     } catch (_) {}
 
-    // 4. Guaranteed Cloud Run Servers
-    for (const s of CLOUD_PROD_SERVERS) {
-      if (!candidateOrigins.includes(s)) candidateOrigins.push(s);
+    // 4. Injected at serve-time by server.ts
+    const injected = window.QUOTEX_TE_INJECTED_SERVER || "";
+    if (injected && !injected.includes("PLACEHOLDER") && injected.startsWith("http")) {
+      addOrigin(injected);
     }
 
-    // 5. location.origin ONLY if NOT running on Quotex/trading site
-    const loc = location.origin || "";
-    if (!loc.includes("market-qx") && !loc.includes("quotex") && !loc.includes("qxbroker") && !loc.includes("qx.io")) {
-      if (!candidateOrigins.includes(loc)) candidateOrigins.push(loc);
+    // 5. location.origin IF NOT running directly on a trading platform
+    try {
+      const loc = window.location.origin || "";
+      if (loc && loc !== "null") {
+        addOrigin(loc);
+      }
+    } catch (_) {}
+
+    // 6. Relative origin fallback ("")
+    if (!list.includes("")) {
+      list.push("");
     }
 
+    return list;
+  }
+
+  // Active or last successfully connected server origin
+  let SERVER_ORIGIN = (function () {
+    try {
+      const s = localStorage.getItem(SERVER_URL_STORAGE);
+      if (s) return s;
+    } catch (_) {}
+    const c = getServerCandidateOrigins();
+    return c[0] || "";
+  })();
+
+  // Robust multi-origin API caller
+  async function callServerEndpoint(endpointPath, method, payload) {
+    const candidateOrigins = getServerCandidateOrigins();
     let lastError = null;
+
+    const cleanPath = endpointPath.startsWith("/") ? endpointPath : "/" + endpointPath;
+    let altPath = null;
+    if (cleanPath.startsWith("/api/license/")) {
+      altPath = cleanPath.replace("/api/license/", "/api/public/license/");
+    } else if (cleanPath.startsWith("/api/public/license/")) {
+      altPath = cleanPath.replace("/api/public/license/", "/api/license/");
+    }
+
     for (const base of candidateOrigins) {
-      try {
-        const cleanBase = base.replace(/\/+$/, "");
-        const url = cleanBase + endpointPath;
-        const controller = new AbortController();
-        const timeoutId = setTimeout(() => controller.abort(), 7000);
+      const pathsToTry = [cleanPath];
+      if (altPath) pathsToTry.push(altPath);
 
-        const res = await fetch(url, {
-          method: method || "GET",
-          headers: { "Content-Type": "application/json" },
-          body: payload ? JSON.stringify(payload) : undefined,
-          signal: controller.signal,
-        });
-        clearTimeout(timeoutId);
-
-        let data = null;
+      for (const p of pathsToTry) {
         try {
-          data = await res.json();
-        } catch (_) {}
+          const cleanBase = base ? base.replace(/\/+$/, "") : "";
+          const url = cleanBase ? `${cleanBase}${p}` : p;
+          const controller = new AbortController();
+          const timeoutId = setTimeout(() => controller.abort(), 4000);
 
-        if (res.ok) {
-          SERVER_ORIGIN = cleanBase;
-          return { ok: true, data };
-        } else if (data && typeof data === "object") {
-          return { ok: false, data, status: res.status };
+          const res = await fetch(url, {
+            method: method || "GET",
+            headers: {
+              "Content-Type": "application/json",
+              "Accept": "application/json",
+            },
+            body: payload ? JSON.stringify(payload) : undefined,
+            signal: controller.signal,
+          });
+          clearTimeout(timeoutId);
+
+          let data = null;
+          try {
+            data = await res.json();
+          } catch (_) {}
+
+          // If 404 and alternate path available, try alternate path
+          if (res.status === 404 && p === cleanPath && altPath) {
+            continue;
+          }
+
+          if (res.ok) {
+            if (cleanBase) {
+              SERVER_ORIGIN = cleanBase;
+              try { localStorage.setItem(SERVER_URL_STORAGE, cleanBase); } catch (_) {}
+            }
+            return { ok: true, data, status: res.status, url };
+          } else if (data && typeof data === "object") {
+            // Server responded with an actual error response (e.g. 403 device limit or 404 invalid key)
+            if (cleanBase) {
+              SERVER_ORIGIN = cleanBase;
+              try { localStorage.setItem(SERVER_URL_STORAGE, cleanBase); } catch (_) {}
+            }
+            return { ok: false, data, status: res.status, message: data.message || data.error, url };
+          }
+        } catch (err) {
+          lastError = err && err.message ? err.message : "Connection failed";
         }
-      } catch (err) {
-        lastError = err && err.message ? err.message : "Connection failed";
       }
     }
 
-    return { ok: false, networkError: true, message: "Server connection failed. Please check network." };
+    return {
+      ok: false,
+      networkError: true,
+      message: "Server connection failed. Please check network.",
+      lastError,
+    };
   }
 
-  let SERVER_ORIGIN = CLOUD_PROD_SERVERS[0];
+  // Quick Ping to verify connection
+  async function pingServer() {
+    return await callServerEndpoint("/api/license/ping", "GET");
+  }
 
   // ===================================================================
   // 1. DEVICE IDENTIFIER (HWID) GENERATOR
@@ -207,9 +290,11 @@
     const key = String(rawKey || "").trim().toUpperCase();
     if (!key) return { success: false, message: "Please enter your license key." };
 
-    const result = await callServerEndpoint("/api/public/license/activate", "POST", {
+    const result = await callServerEndpoint("/api/license/activate", "POST", {
       licenseKey: key,
+      key: key,
       hwid: CURRENT_HWID,
+      deviceId: CURRENT_HWID,
       botType: BRAND_TITLE,
       userAgent: navigator.userAgent,
       deviceLabel: `${navigator.platform || "Web"} Browser`,
@@ -221,6 +306,7 @@
         cachedLicenseData = result.data.license;
         try { localStorage.setItem(LIC_INFO_STORAGE, JSON.stringify(result.data.license)); } catch (_) {}
       }
+      startHeartbeatTimer(key);
       return { success: true, license: result.data.license };
     }
 
@@ -228,33 +314,61 @@
       return { success: false, message: result.data.message };
     }
 
+    if (result.message && !result.networkError) {
+      return { success: false, message: result.message };
+    }
+
     // Offline fallback: if previously validated key matches
     const saved = localStorage.getItem(LIC_STORAGE_KEY);
-    if (saved && saved.toUpperCase() === key) {
+    if (saved && saved.toUpperCase() === key && cachedLicenseData) {
       return { success: true, license: cachedLicenseData, offline: true };
     }
-    return { success: false, message: result.message || "Server connection failed. Please check network." };
+
+    return {
+      success: false,
+      message: result.message || "Server connection failed. Please check network.",
+      networkError: result.networkError,
+    };
   }
 
   async function validateExistingLicense() {
     const savedKey = localStorage.getItem(LIC_STORAGE_KEY);
     if (!savedKey) return false;
 
-    const result = await callServerEndpoint("/api/public/license/validate", "POST", {
+    const result = await callServerEndpoint("/api/license/verify", "POST", {
       licenseKey: savedKey,
+      key: savedKey,
       hwid: CURRENT_HWID,
+      deviceId: CURRENT_HWID,
       botType: BRAND_TITLE,
       userAgent: navigator.userAgent,
     });
 
-    if (result.ok && result.data && result.data.state === "ACTIVE") {
+    if (result.ok && result.data && (result.data.state === "ACTIVE" || result.data.status === "ACTIVE")) {
       if (result.data.license) {
         cachedLicenseData = result.data.license;
         try { localStorage.setItem(LIC_INFO_STORAGE, JSON.stringify(result.data.license)); } catch (_) {}
       }
+      startHeartbeatTimer(savedKey);
       return true;
     }
     return Boolean(cachedLicenseData);
+  }
+
+  // Periodic heartbeat timer
+  let heartbeatInterval = null;
+  function startHeartbeatTimer(key) {
+    if (heartbeatInterval) clearInterval(heartbeatInterval);
+    heartbeatInterval = setInterval(async () => {
+      try {
+        await callServerEndpoint("/api/license/heartbeat", "POST", {
+          licenseKey: key,
+          key: key,
+          hwid: CURRENT_HWID,
+          botType: BRAND_TITLE,
+        });
+      } catch (_) {}
+    }, 60000);
   }
 
   // Record trade usage on server
@@ -262,8 +376,9 @@
     const key = localStorage.getItem(LIC_STORAGE_KEY);
     if (!key) return { allowed: false };
 
-    const result = await callServerEndpoint("/api/public/license/use", "POST", {
+    const result = await callServerEndpoint("/api/license/use", "POST", {
       licenseKey: key,
+      key: key,
       hwid: CURRENT_HWID,
       botType: BRAND_TITLE,
       action: "TRADE",
@@ -442,8 +557,55 @@
         text-align: center;
         letter-spacing: 0.03em;
       }
+      .qte-server-row {
+        margin-top: 10px;
+        padding: 6px 10px;
+        border-radius: 8px;
+        background: rgba(15, 23, 42, 0.7);
+        border: 1px solid rgba(56, 189, 248, 0.2);
+        display: flex;
+        align-items: center;
+        justify-content: space-between;
+        font-size: 10.5px;
+        color: #94a3b8;
+      }
+      .qte-server-left {
+        display: flex;
+        align-items: center;
+        gap: 6px;
+        overflow: hidden;
+        text-overflow: ellipsis;
+        white-space: nowrap;
+      }
+      .qte-server-dot {
+        width: 7px;
+        height: 7px;
+        border-radius: 50%;
+        background: #eab308;
+        display: inline-block;
+        flex-shrink: 0;
+      }
+      .qte-server-dot.connected {
+        background: #10b981;
+        box-shadow: 0 0 8px #10b981;
+      }
+      .qte-server-dot.error {
+        background: #ef4444;
+      }
+      .qte-server-change-btn {
+        background: transparent;
+        border: none;
+        color: #38bdf8;
+        font-size: 10.5px;
+        font-weight: 700;
+        cursor: pointer;
+        padding: 0;
+        text-decoration: underline;
+        margin-left: 6px;
+        flex-shrink: 0;
+      }
       .qte-footer-links {
-        margin-top: 14px;
+        margin-top: 12px;
         display: flex;
         justify-content: space-between;
         align-items: center;
@@ -482,6 +644,14 @@
           <span class="qte-hwid-val">${CURRENT_HWID}</span>
         </div>
 
+        <div class="qte-server-row">
+          <div class="qte-server-left">
+            <span class="qte-server-dot" id="qte-server-dot"></span>
+            <span id="qte-server-host">Checking server connection...</span>
+          </div>
+          <button type="button" class="qte-server-change-btn" id="qte-change-server-btn">Change</button>
+        </div>
+
         <div class="qte-input-wrap">
           <input id="qte-lic-input" type="text" maxlength="24" spellcheck="false" placeholder="TE-XXXX-XXXX-XXXX-XXXX" value="${savedKey}" />
         </div>
@@ -501,8 +671,42 @@
     const errorEl = overlay.querySelector("#qte-lic-error");
     const activateBtn = overlay.querySelector("#qte-activate-btn");
     const vipKeyBtn = overlay.querySelector("#qte-use-vip-key");
+    const serverDot = overlay.querySelector("#qte-server-dot");
+    const serverHostText = overlay.querySelector("#qte-server-host");
+    const changeServerBtn = overlay.querySelector("#qte-change-server-btn");
 
-    // Auto-formatting for TE-XXXX-XXXX-XXXX-XXXX
+    async function updateServerStatusDisplay() {
+      const candidates = getServerCandidateOrigins();
+      const current = SERVER_ORIGIN || candidates[0] || (location.origin ? location.origin : "Auto");
+      serverHostText.textContent = `Server: ${current.replace(/^https?:\/\//, "") || "Local"}`;
+      
+      const ping = await pingServer();
+      if (ping.ok) {
+        serverDot.className = "qte-server-dot connected";
+        serverHostText.textContent = `Online: ${SERVER_ORIGIN ? SERVER_ORIGIN.replace(/^https?:\/\//, "") : "Direct Host"}`;
+      } else {
+        serverDot.className = "qte-server-dot error";
+        serverHostText.textContent = `Server Offline: ${SERVER_ORIGIN ? SERVER_ORIGIN.replace(/^https?:\/\//, "") : "Not Reachable"}`;
+      }
+    }
+    updateServerStatusDisplay();
+
+    changeServerBtn.addEventListener("click", () => {
+      const current = localStorage.getItem(SERVER_URL_STORAGE) || SERVER_ORIGIN || "";
+      const customUrl = prompt("Enter Quotex TE License Server URL (e.g. https://your-domain.run.app):", current);
+      if (customUrl !== null) {
+        const trimmed = customUrl.trim().replace(/\/+$/, "");
+        if (trimmed) {
+          localStorage.setItem(SERVER_URL_STORAGE, trimmed);
+          SERVER_ORIGIN = trimmed;
+        } else {
+          localStorage.removeItem(SERVER_URL_STORAGE);
+          SERVER_ORIGIN = "";
+        }
+        updateServerStatusDisplay();
+      }
+    });
+
     inputEl.addEventListener("input", () => {
       let val = inputEl.value.toUpperCase().replace(/[^A-Z0-9]/g, "");
       if (val.startsWith("TE")) {
@@ -550,6 +754,14 @@
         onSuccess();
       } else {
         errorEl.textContent = res.message || "License activation rejected.";
+        if (res.networkError) {
+          serverDot.className = "qte-server-dot error";
+          errorEl.innerHTML = `${res.message} <button type="button" class="qte-demo-key-btn" id="qte-fix-srv-btn" style="display:inline;margin-left:4px;">Configure Server URL</button>`;
+          const fixBtn = errorEl.querySelector("#qte-fix-srv-btn");
+          if (fixBtn) {
+            fixBtn.addEventListener("click", () => changeServerBtn.click());
+          }
+        }
         inputEl.focus();
       }
     }
@@ -569,10 +781,8 @@
   // 5. QUOTEX TE CORE LOGIC (ROUND CONTROL + WEBSOCKET TRACKING)
   // ===================================================================
   function startQuotexTE() {
-    const TAG = "QX_CANDLE_ROUND";
     const STORE_KEY = "qxte_round_ui";
     const decoder = new TextDecoder();
-    const encoder = new TextEncoder();
 
     const state = {
       asset: null,
@@ -587,7 +797,6 @@
       events: {},
       sockets: [],
     };
-    let lastDataAt = 0;
 
     // Fake candle controller
     const fake = {
@@ -621,78 +830,6 @@
       fake.holdOffset = null;
     };
 
-    const fakePrice = (realPrice) => {
-      if (!fake.active || !isFinite(fake.target)) return realPrice;
-      if (!ThunderXSwitchAdapter.isEnabled()) return realPrice;
-      if (fake.startPrice == null) {
-        fake.startPrice = realPrice;
-        fake.startAt = Date.now() / 1000;
-      }
-      const dur = Math.max(0.2, fake.seconds);
-      const elapsed = Date.now() / 1000 - fake.startAt;
-      if (elapsed < dur) {
-        const p = elapsed / dur;
-        return fake.startPrice + (fake.target - fake.startPrice) * p;
-      }
-      if (fake.holdOffset == null) fake.holdOffset = fake.target - realPrice;
-      return realPrice + fake.holdOffset;
-    };
-
-    const fakeifyTicks = (rows) => {
-      if (!Array.isArray(rows)) return rows;
-      let touched = false;
-      const mapped = rows.map((r) => {
-        if (!Array.isArray(r) || r.length < 2) return r;
-        const copy = r.slice();
-        const p = Number(copy[1]);
-        if (isFinite(p)) {
-          copy[1] = fakePrice(p);
-          touched = true;
-        }
-        return copy;
-      });
-      return touched ? mapped : rows;
-    };
-
-    const fakeifyCandles = (rows) => {
-      if (!Array.isArray(rows)) return rows;
-      let touched = false;
-      const mapped = rows.map((c) => {
-        if (!c || typeof c !== "object") return c;
-        const o = fakePrice(c.open);
-        const cl = fakePrice(c.close);
-        const h = fakePrice(c.high);
-        const l = fakePrice(c.low);
-        if (o !== c.open || cl !== c.close || h !== c.high || l !== c.low) {
-          touched = true;
-          return {
-            ...c,
-            open: o,
-            close: cl,
-            high: Math.max(o, cl, h),
-            low: Math.min(o, cl, l),
-          };
-        }
-        return c;
-      });
-      return touched ? mapped : rows;
-    };
-
-    const fakeifyLiveCandle = (c) => {
-      if (!c || typeof c !== "object") return c;
-      const o = fakePrice(c.open);
-      const cl = fakePrice(c.close);
-      const h = fakePrice(c.high);
-      const l = fakePrice(c.low);
-      return {
-        ...c,
-        open: o,
-        close: cl,
-        high: Math.max(o, cl, h),
-        low: Math.min(o, cl, l),
-      };
-    };
-
     // WebSocket Hook
     const OrigWS = window.WebSocket;
     if (OrigWS && !OrigWS.__qteHooked) {
@@ -718,7 +855,6 @@
             if (data.asset) state.asset = data.asset;
             if (data.period) state.period = data.period;
             if (data.ticks) state.ticks += 1;
-            lastDataAt = Date.now();
           }
         };
 
@@ -733,7 +869,6 @@
       } catch (_) {}
     }
 
-    // Load saved settings
     let uiRound = { fakeTarget: null, fakeSeconds: 5 };
     try {
       const saved = JSON.parse(localStorage.getItem(STORE_KEY) || "null");
@@ -912,7 +1047,6 @@
       chip.classList.toggle("live", isSwitchOn);
       chip.textContent = isSwitchOn ? "LIVE" : "DISABLED";
 
-      // License status box
       const savedKey = localStorage.getItem(LIC_STORAGE_KEY) || "TE-VIP8-****-2026";
       const licBox = document.createElement("div");
       licBox.className = "lic-info-box";
@@ -1003,7 +1137,6 @@
       btns.appendChild(stopBtn);
       body.appendChild(btns);
 
-      // Thunder X Switch Row
       const switchBox = document.createElement("div");
       switchBox.className = "switch-box";
       switchBox.innerHTML = `
@@ -1021,7 +1154,6 @@
         renderActive();
       });
 
-      // Switch to Thunder X Direct Action
       const switchBotBtn = document.createElement("button");
       switchBotBtn.type = "button";
       switchBotBtn.className = "switch-to-tx-btn";
@@ -1076,7 +1208,6 @@
       });
     }
 
-    // Subscribe to Thunder X Switch updates
     ThunderXSwitchAdapter.subscribe((enabled) => {
       if (!enabled && fakeRunning) {
         fakeRunning = false;
@@ -1085,7 +1216,6 @@
       renderActive();
     });
 
-    // Positioning and dragging
     let pos = { x: window.innerWidth - 96, y: 120 };
     try {
       const savedPos = JSON.parse(localStorage.getItem("qte_pos") || "null");
