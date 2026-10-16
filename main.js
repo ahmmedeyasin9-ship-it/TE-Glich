@@ -34,14 +34,88 @@
   const HWID_STORAGE_KEY = "qte_device_hwid";
   const LIC_INFO_STORAGE = "qte_license_info";
 
-  // Backend Origin detection
-  let SERVER_ORIGIN = location.origin;
-  try {
-    const script = document.currentScript || document.querySelector("script[src*='quotex-te.js']");
-    if (script && script.src) {
-      SERVER_ORIGIN = new URL(script.src).origin;
+  // Production and fallback Cloud Server origins
+  const CLOUD_PROD_SERVERS = [
+    "https://ais-pre-gdlcsfnefccf4ctpdxdyhe-878201435123.asia-southeast1.run.app",
+    "https://ais-dev-gdlcsfnefccf4ctpdxdyhe-878201435123.asia-southeast1.run.app"
+  ];
+
+  // Robust multi-origin API caller (never fails with false network errors on Quotex)
+  async function callServerEndpoint(endpointPath, method, payload) {
+    const candidateOrigins = [];
+
+    // 1. Injected at serve-time by server.ts
+    const injected = "http://ais-dev-gdlcsfnefccf4ctpdxdyhe-878201435123.asia-southeast1.run.app";
+    if (injected && !injected.includes("PLACEHOLDER") && injected.startsWith("http")) {
+      candidateOrigins.push(injected);
     }
-  } catch (_) {}
+
+    // 2. Global variable if defined by loader
+    if (window.__QUOTEX_TE_SERVER__ && typeof window.__QUOTEX_TE_SERVER__ === "string") {
+      candidateOrigins.push(window.__QUOTEX_TE_SERVER__);
+    }
+
+    // 3. Inspect scripts in DOM
+    try {
+      const scripts = document.querySelectorAll("script");
+      for (let i = 0; i < scripts.length; i++) {
+        const src = scripts[i].src || "";
+        if (src.includes("quotex-te.js") || src.includes("thunderx")) {
+          const u = new URL(src);
+          if (!u.origin.includes("market-qx") && !u.origin.includes("quotex") && !u.origin.includes("qxbroker")) {
+            if (!candidateOrigins.includes(u.origin)) candidateOrigins.push(u.origin);
+          }
+        }
+      }
+    } catch (_) {}
+
+    // 4. Guaranteed Cloud Run Servers
+    for (const s of CLOUD_PROD_SERVERS) {
+      if (!candidateOrigins.includes(s)) candidateOrigins.push(s);
+    }
+
+    // 5. location.origin ONLY if NOT running on Quotex/trading site
+    const loc = location.origin || "";
+    if (!loc.includes("market-qx") && !loc.includes("quotex") && !loc.includes("qxbroker") && !loc.includes("qx.io")) {
+      if (!candidateOrigins.includes(loc)) candidateOrigins.push(loc);
+    }
+
+    let lastError = null;
+    for (const base of candidateOrigins) {
+      try {
+        const cleanBase = base.replace(/\/+$/, "");
+        const url = cleanBase + endpointPath;
+        const controller = new AbortController();
+        const timeoutId = setTimeout(() => controller.abort(), 7000);
+
+        const res = await fetch(url, {
+          method: method || "GET",
+          headers: { "Content-Type": "application/json" },
+          body: payload ? JSON.stringify(payload) : undefined,
+          signal: controller.signal,
+        });
+        clearTimeout(timeoutId);
+
+        let data = null;
+        try {
+          data = await res.json();
+        } catch (_) {}
+
+        if (res.ok) {
+          SERVER_ORIGIN = cleanBase;
+          return { ok: true, data };
+        } else if (data && typeof data === "object") {
+          return { ok: false, data, status: res.status };
+        }
+      } catch (err) {
+        lastError = err && err.message ? err.message : "Connection failed";
+      }
+    }
+
+    return { ok: false, networkError: true, message: "Server connection failed. Please check network." };
+  }
+
+  let SERVER_ORIGIN = CLOUD_PROD_SERVERS[0];
 
   // ===================================================================
   // 1. DEVICE IDENTIFIER (HWID) GENERATOR
@@ -133,69 +207,54 @@
     const key = String(rawKey || "").trim().toUpperCase();
     if (!key) return { success: false, message: "Please enter your license key." };
 
-    try {
-      const res = await fetch(`${SERVER_ORIGIN}/api/public/license/activate`, {
-        method: "POST",
-        headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({
-          licenseKey: key,
-          hwid: CURRENT_HWID,
-          botType: BRAND_TITLE,
-          userAgent: navigator.userAgent,
-          deviceLabel: `${navigator.platform || "Web"} Browser`,
-        }),
-      });
+    const result = await callServerEndpoint("/api/public/license/activate", "POST", {
+      licenseKey: key,
+      hwid: CURRENT_HWID,
+      botType: BRAND_TITLE,
+      userAgent: navigator.userAgent,
+      deviceLabel: `${navigator.platform || "Web"} Browser`,
+    });
 
-      const data = await res.json();
-      if (res.ok && data.success) {
-        localStorage.setItem(LIC_STORAGE_KEY, key);
-        if (data.license) {
-          cachedLicenseData = data.license;
-          try { localStorage.setItem(LIC_INFO_STORAGE, JSON.stringify(data.license)); } catch (_) {}
-        }
-        return { success: true, license: data.license };
-      } else {
-        return { success: false, message: data.message || "License activation rejected." };
+    if (result.ok && result.data && result.data.success) {
+      localStorage.setItem(LIC_STORAGE_KEY, key);
+      if (result.data.license) {
+        cachedLicenseData = result.data.license;
+        try { localStorage.setItem(LIC_INFO_STORAGE, JSON.stringify(result.data.license)); } catch (_) {}
       }
-    } catch (err) {
-      // Offline fallback: if previously validated key matches
-      const saved = localStorage.getItem(LIC_STORAGE_KEY);
-      if (saved && saved.toUpperCase() === key) {
-        return { success: true, license: cachedLicenseData, offline: true };
-      }
-      return { success: false, message: "Server connection failed. Please check network." };
+      return { success: true, license: result.data.license };
     }
+
+    if (result.data && result.data.message) {
+      return { success: false, message: result.data.message };
+    }
+
+    // Offline fallback: if previously validated key matches
+    const saved = localStorage.getItem(LIC_STORAGE_KEY);
+    if (saved && saved.toUpperCase() === key) {
+      return { success: true, license: cachedLicenseData, offline: true };
+    }
+    return { success: false, message: result.message || "Server connection failed. Please check network." };
   }
 
   async function validateExistingLicense() {
     const savedKey = localStorage.getItem(LIC_STORAGE_KEY);
     if (!savedKey) return false;
 
-    try {
-      const res = await fetch(`${SERVER_ORIGIN}/api/public/license/validate`, {
-        method: "POST",
-        headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({
-          licenseKey: savedKey,
-          hwid: CURRENT_HWID,
-          botType: BRAND_TITLE,
-          userAgent: navigator.userAgent,
-        }),
-      });
+    const result = await callServerEndpoint("/api/public/license/validate", "POST", {
+      licenseKey: savedKey,
+      hwid: CURRENT_HWID,
+      botType: BRAND_TITLE,
+      userAgent: navigator.userAgent,
+    });
 
-      const data = await res.json();
-      if (res.ok && data.state === "ACTIVE") {
-        if (data.license) {
-          cachedLicenseData = data.license;
-          try { localStorage.setItem(LIC_INFO_STORAGE, JSON.stringify(data.license)); } catch (_) {}
-        }
-        return true;
+    if (result.ok && result.data && result.data.state === "ACTIVE") {
+      if (result.data.license) {
+        cachedLicenseData = result.data.license;
+        try { localStorage.setItem(LIC_INFO_STORAGE, JSON.stringify(result.data.license)); } catch (_) {}
       }
-      return false;
-    } catch (_) {
-      // Allow if cached
-      return Boolean(cachedLicenseData);
+      return true;
     }
+    return Boolean(cachedLicenseData);
   }
 
   // Record trade usage on server
@@ -203,34 +262,29 @@
     const key = localStorage.getItem(LIC_STORAGE_KEY);
     if (!key) return { allowed: false };
 
-    try {
-      const res = await fetch(`${SERVER_ORIGIN}/api/public/license/use`, {
-        method: "POST",
-        headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({
-          licenseKey: key,
-          hwid: CURRENT_HWID,
-          botType: BRAND_TITLE,
-          action: "TRADE",
-          side,
-          asset,
-        }),
-      });
+    const result = await callServerEndpoint("/api/public/license/use", "POST", {
+      licenseKey: key,
+      hwid: CURRENT_HWID,
+      botType: BRAND_TITLE,
+      action: "TRADE",
+      side,
+      asset,
+    });
 
-      const data = await res.json();
-      if (res.ok && data.allowed) {
-        if (cachedLicenseData) {
-          cachedLicenseData.todayUsage = data.todayUsage;
-          cachedLicenseData.currentUsage = data.currentUsage;
-        }
-        return data;
-      } else {
-        showLicenseToast(data.message || "License usage limit reached!");
-        return { allowed: false, message: data.message };
+    if (result.ok && result.data && result.data.allowed) {
+      if (cachedLicenseData) {
+        cachedLicenseData.todayUsage = result.data.todayUsage;
+        cachedLicenseData.currentUsage = result.data.currentUsage;
       }
-    } catch (_) {
-      return { allowed: true };
+      return result.data;
     }
+
+    if (result.data && result.data.message) {
+      showLicenseToast(result.data.message);
+      return { allowed: false, message: result.data.message };
+    }
+
+    return { allowed: true };
   }
 
   function showLicenseToast(msg) {
