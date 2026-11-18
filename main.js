@@ -1,1330 +1,787 @@
-/**
- * ===================================================================
- * Quotex TE — International License Protected Client & Bot Switch
- * ===================================================================
- * Branding: Quotex TE (Short: TE)
- * Logo: https://i.postimg.cc/QM1CqkvN/Chat-GPT-Image-Aug-27-2026-08-36-34-PM-20260828-120448.jpg
- * 
- * Features:
- * 1. Server-Side License Authentication System:
- *    - Format: TE-XXXX-XXXX-XXXX-XXXX
- *    - Device HWID Tracking & Configurable Device Limits
- *    - Server-side usage limits (Daily & Total)
- *    - Instant validation with /api/public/license/validate & activate
- *    - Detailed error messaging (Device limit, Expired, Revoked, Suspended)
- * 2. Thunder X Switch:
- *    - window.THUNDER_X_SWITCH_STATE (true / false)
- *    - window.dispatchEvent(new CustomEvent("THUNDER_X_SWITCH", { detail: { enabled } }))
- *    - In-panel mobile-friendly switch toggle & direct switcher
- * 3. Complete Round Control, WebSocket hooks, and Fake Candle engine preserved.
- */
-(function () {
-  // Global duplicate initialization guard
-  if (window.__QUOTEX_TE_INITIALIZED__) {
-    console.warn("Quotex TE is already running.");
-    return;
-  }
-  window.__QUOTEX_TE_INITIALIZED__ = true;
+/* =====================================================================
+   QUOTEX ZR PRO — বুকমার্ক সংস্করণ
+   ---------------------------------------------------------------------
+   Read-only সংস্করণ: Trader ID / License verification সরানো হয়েছে।
+   কোনো Buy/Sell click আটকানো হয় না; শুধু market/socket data পর্যবেক্ষণ করে।
 
-  // Constants & Branding
-  const BRAND_TITLE = "Quotex TE";
-  const BRAND_SHORT = "TE";
-  const BRAND_LOGO = "https://i.postimg.cc/QM1CqkvN/Chat-GPT-Image-Aug-27-2026-08-36-34-PM-20260828-120448.jpg";
-  const LIC_STORAGE_KEY = "qte_license_key";
-  const HWID_STORAGE_KEY = "qte_device_hwid";
-  const LIC_INFO_STORAGE = "qte_license_info";
-  const SERVER_URL_STORAGE = "qte_server_url";
+   পপআপ: Candle time (সেকেন্ড, ডিফল্ট 5) → Apply।
+   socket থেকে শুধু পড়া হয় — চার্ট, ব্যালেন্স বা ট্রেডের ফলাফল বদলানো হয় না।
 
-  // Dynamic server candidates resolution (never blocks with stale/unreachable dev servers)
-  function getServerCandidateOrigins() {
-    const list = [];
+   বন্ধ: qxUninstall()
+   ===================================================================== */
+(() => {
+  "use strict";
+  if (window.__qxCandleConsole) return;
+  window.__qxCandleConsole = true;
 
-    function addOrigin(raw) {
-      if (!raw || typeof raw !== "string") return;
+  const STORE_KEY = "qxCandleRoundUi";
+  const decoder = new TextDecoder();
+  let qxEngineLive = false;
+
+  /* ===================================================================
+     অংশ ১ — ডেটা ট্র্যাকিং (শুধু পড়া) + WS হুক
+     =================================================================== */
+
+  const state = {
+    asset: null,
+    assetSource: null,
+    period: 60,
+    periodSource: null,
+    serverOffset: 0,
+    lastTick: null,
+    candle: null,
+    history: [],
+    ticks: 0,
+    events: {},
+    sockets: [],
+  };
+  let lastDataAt = 0;
+
+  const countEvent = (name) => {
+    state.events[name] = (state.events[name] || 0) + 1;
+  };
+
+  const setAsset = (asset, source) => {
+    if (!asset || typeof asset !== "string") return;
+    if (state.asset !== asset) {
+      state.asset = asset;
+      state.candle = null;
+      state.history = [];
+    }
+    state.assetSource = source;
+  };
+
+  const setPeriod = (period, source) => {
+    const p = Number(period);
+    if (!p || p < 1 || p > 86400) return;
+    if (state.periodSource === "user" && source !== "user") return;
+    if (state.period !== p) {
+      state.period = p;
+      state.candle = null;
+      state.history = [];
+    }
+    state.periodSource = source;
+  };
+
+  const onTick = (asset, time, price) => {
+    if (typeof asset !== "string" || !isFinite(time) || !isFinite(price)) return;
+    if (!state.asset) setAsset(asset, "first-tick");
+    if (asset !== state.asset) return;
+
+    state.ticks++;
+    state.serverOffset = time - Date.now() / 1000;
+    state.lastTick = { time, price };
+    lastDataAt = Date.now();
+
+    const start = Math.floor(time / state.period) * state.period;
+    const c = state.candle;
+    if (!c || c.start !== start) {
+      if (c && start > c.start) {
+        state.history.push({ start: c.start, open: c.open, close: c.close, high: c.high, low: c.low });
+        if (state.history.length > 50) state.history.shift();
+      }
+      state.candle = { start, open: price, high: price, low: price, close: price, fromHistory: false };
+    } else {
+      c.close = price;
+      if (price > c.high) c.high = price;
+      if (price < c.low) c.low = price;
+    }
+  };
+
+  const onHistory = (obj) => {
+    if (!obj || typeof obj !== "object") return;
+    if (obj.asset && !state.asset) setAsset(obj.asset, "history");
+    if (obj.asset && obj.asset !== state.asset) return;
+    if (obj.period) {
+      setPeriod(obj.period, "history");
+      if (Number(obj.period) !== state.period) return;
+    }
+    const candles = Array.isArray(obj.candles) ? obj.candles : null;
+    if (!candles || !candles.length) return;
+
+    const parsed = candles
+      .filter((k) => Array.isArray(k) && k.length >= 5)
+      .map((k) => ({ start: Number(k[0]), open: Number(k[1]), close: Number(k[2]), high: Number(k[3]), low: Number(k[4]) }))
+      .filter((k) => isFinite(k.start) && isFinite(k.open))
+      .sort((a, b) => a.start - b.start);
+    if (!parsed.length) return;
+
+    const last = parsed[parsed.length - 1];
+    const nowServer = Date.now() / 1000 + state.serverOffset;
+    const currentStart = Math.floor(nowServer / state.period) * state.period;
+
+    const closed = parsed.filter((k) => k.start < currentStart);
+    state.history = closed.slice(-50);
+    if (last.start === currentStart) {
+      state.candle = { ...last, fromHistory: true };
+    }
+    lastDataAt = Date.now();
+  };
+
+  const handlePayload = (data) => {
+    if (Array.isArray(data)) {
+      let handled = false;
+      for (const row of data) {
+        if (Array.isArray(row) && row.length >= 3 && typeof row[0] === "string" && typeof row[1] === "number" && typeof row[2] === "number") {
+          onTick(row[0], row[1], row[2]);
+          handled = true;
+        }
+      }
+      if (handled) countEvent("quotes/stream");
+      return;
+    }
+    if (data && typeof data === "object") {
+      if (Array.isArray(data.candles)) {
+        countEvent("history(candles)");
+        onHistory(data);
+      }
+    }
+  };
+
+  const parseSocketIoText = (text) => {
+    const m = /^\d+(?:-)?(?:\/[^,]*,)?(\d*)(\[.*)$/s.exec(text);
+    if (!m) return null;
+    try {
+      const arr = JSON.parse(m[2]);
+      if (Array.isArray(arr) && typeof arr[0] === "string") return { event: arr[0], data: arr[1] };
+    } catch (_) {}
+    return null;
+  };
+
+  const handleIncomingText = (text) => {
+    if (text.length > 2 && (text[0] === "[" || text[0] === "{")) {
       try {
-        let u = raw.trim().replace(/\/+$/, "");
-        if (!u) return;
-        if (!u.startsWith("http://") && !u.startsWith("https://")) {
-          if (u.startsWith("/")) return;
-          u = (location.protocol === "http:" ? "http://" : "https://") + u;
-        }
-        const parsed = new URL(u);
-        const origin = parsed.origin;
-        const host = parsed.hostname.toLowerCase();
-        // Ignore trading platform hostnames
-        if (
-          host.includes("market-qx") ||
-          host.includes("quotex") ||
-          host.includes("qxbroker") ||
-          host.includes("qx.io") ||
-          host.includes("qx-trade")
-        ) {
-          return;
-        }
-        if (!list.includes(origin)) list.push(origin);
+        handlePayload(JSON.parse(text));
       } catch (_) {}
+      return;
     }
-
-    // 1. Manually configured server URL (localStorage or global variable)
-    try {
-      const stored = localStorage.getItem(SERVER_URL_STORAGE);
-      if (stored) addOrigin(stored);
-    } catch (_) {}
-    if (window.__QUOTEX_TE_SERVER__) addOrigin(window.__QUOTEX_TE_SERVER__);
-
-    // 2. Current executing script tag (document.currentScript) — exact host serving quotex-te.js
-    try {
-      if (document.currentScript && document.currentScript.src) {
-        addOrigin(new URL(document.currentScript.src).origin);
-      }
-    } catch (_) {}
-
-    // 3. Inspect scripts in DOM
-    try {
-      const scripts = document.querySelectorAll("script");
-      for (let i = 0; i < scripts.length; i++) {
-        const src = scripts[i].src || "";
-        if (src && (src.includes("quotex-te.js") || src.includes("thunderx") || src.includes("secondbot"))) {
-          addOrigin(new URL(src).origin);
-        }
-      }
-    } catch (_) {}
-
-    // 4. Injected at serve-time by server.ts
-    const injected = window.QUOTEX_TE_INJECTED_SERVER || "";
-    if (injected && !injected.includes("PLACEHOLDER") && injected.startsWith("http")) {
-      addOrigin(injected);
+    const msg = parseSocketIoText(text);
+    if (!msg) return;
+    countEvent(msg.event);
+    const d = msg.data;
+    if (d && d._placeholder) return;
+    if (msg.event === "quotes/stream") handlePayload(d);
+    else if (/history/i.test(msg.event) || (d && Array.isArray(d.candles))) onHistory(d);
+    else if (msg.event === "instruments/update" && d && d.asset) {
+      setAsset(d.asset, "server");
+      if (d.period) setPeriod(d.period, "server");
     }
+  };
 
-    // 5. location.origin IF NOT running directly on a trading platform
+  const handleIncomingBinary = (buf) => {
+    let bytes = new Uint8Array(buf);
+    if (bytes.length && bytes[0] < 10) bytes = bytes.subarray(1);
+    const text = decoder.decode(bytes);
     try {
-      const loc = window.location.origin || "";
-      if (loc && loc !== "null") {
-        addOrigin(loc);
-      }
-    } catch (_) {}
-
-    // 6. Relative origin fallback ("")
-    if (!list.includes("")) {
-      list.push("");
-    }
-
-    return list;
-  }
-
-  // Active or last successfully connected server origin
-  let SERVER_ORIGIN = (function () {
-    try {
-      const s = localStorage.getItem(SERVER_URL_STORAGE);
-      if (s) return s;
-    } catch (_) {}
-    const c = getServerCandidateOrigins();
-    return c[0] || "";
-  })();
-
-  // Robust multi-origin API caller
-  async function callServerEndpoint(endpointPath, method, payload) {
-    const candidateOrigins = getServerCandidateOrigins();
-    let lastError = null;
-
-    const cleanPath = endpointPath.startsWith("/") ? endpointPath : "/" + endpointPath;
-    let altPath = null;
-    if (cleanPath.startsWith("/api/license/")) {
-      altPath = cleanPath.replace("/api/license/", "/api/public/license/");
-    } else if (cleanPath.startsWith("/api/public/license/")) {
-      altPath = cleanPath.replace("/api/public/license/", "/api/license/");
-    }
-
-    for (const base of candidateOrigins) {
-      const pathsToTry = [cleanPath];
-      if (altPath) pathsToTry.push(altPath);
-
-      for (const p of pathsToTry) {
-        try {
-          const cleanBase = base ? base.replace(/\/+$/, "") : "";
-          const url = cleanBase ? `${cleanBase}${p}` : p;
-          const controller = new AbortController();
-          const timeoutId = setTimeout(() => controller.abort(), 4000);
-
-          const res = await fetch(url, {
-            method: method || "GET",
-            headers: {
-              "Content-Type": "application/json",
-              "Accept": "application/json",
-            },
-            body: payload ? JSON.stringify(payload) : undefined,
-            signal: controller.signal,
-          });
-          clearTimeout(timeoutId);
-
-          let data = null;
-          try {
-            data = await res.json();
-          } catch (_) {}
-
-          // If 404 and alternate path available, try alternate path
-          if (res.status === 404 && p === cleanPath && altPath) {
-            continue;
-          }
-
-          if (res.ok) {
-            if (cleanBase) {
-              SERVER_ORIGIN = cleanBase;
-              try { localStorage.setItem(SERVER_URL_STORAGE, cleanBase); } catch (_) {}
-            }
-            return { ok: true, data, status: res.status, url };
-          } else if (data && typeof data === "object") {
-            // Server responded with an actual error response (e.g. 403 device limit or 404 invalid key)
-            if (cleanBase) {
-              SERVER_ORIGIN = cleanBase;
-              try { localStorage.setItem(SERVER_URL_STORAGE, cleanBase); } catch (_) {}
-            }
-            return { ok: false, data, status: res.status, message: data.message || data.error, url };
-          }
-        } catch (err) {
-          lastError = err && err.message ? err.message : "Connection failed";
-        }
-      }
-    }
-
-    return {
-      ok: false,
-      networkError: true,
-      message: "Server connection failed. Please check network.",
-      lastError,
-    };
-  }
-
-  // Quick Ping to verify connection
-  async function pingServer() {
-    return await callServerEndpoint("/api/license/ping", "GET");
-  }
-
-  // ===================================================================
-  // 1. DEVICE IDENTIFIER (HWID) GENERATOR
-  // ===================================================================
-  function getDeviceHwid() {
-    try {
-      let hwid = localStorage.getItem(HWID_STORAGE_KEY);
-      if (!hwid) {
-        const rand = Math.random().toString(36).substring(2, 8).toUpperCase();
-        const time = Date.now().toString(16).slice(-4).toUpperCase();
-        const screenScore = ((window.screen.width || 1920) * (window.screen.height || 1080)).toString(16).toUpperCase();
-        hwid = `HWID-${screenScore.slice(0, 4)}-${time}-${rand}`;
-        localStorage.setItem(HWID_STORAGE_KEY, hwid);
-      }
-      return hwid;
+      handlePayload(JSON.parse(text));
     } catch (_) {
-      return `HWID-BROWSER-${Math.random().toString(36).substring(2, 8).toUpperCase()}`;
+      handleIncomingText(text);
     }
-  }
+  };
 
-  const CURRENT_HWID = getDeviceHwid();
-  let cachedLicenseData = null;
+  const handleOutgoing = (data) => {
+    if (typeof data !== "string") return;
+    const msg = parseSocketIoText(data);
+    if (!msg) return;
+    const d = msg.data;
+    countEvent("→ " + msg.event);
+    switch (msg.event) {
+      case "instruments/update":
+      case "chart_notification/get":
+      case "history/load/line":
+      case "instruments/follow":
+        if (d && typeof d === "object") {
+          if (d.asset) setAsset(d.asset, "client:" + msg.event);
+          if (d.period) setPeriod(d.period, "client:" + msg.event);
+        }
+        break;
+      case "depth/follow":
+        if (typeof d === "string") setAsset(d, "client:depth/follow");
+        break;
+    }
+  };
 
-  try {
-    const stored = localStorage.getItem(LIC_INFO_STORAGE);
-    if (stored) cachedLicenseData = JSON.parse(stored);
-  } catch (_) {}
+  const trackState = (raw) => {
+    try {
+      if (typeof raw === "string") handleIncomingText(raw);
+      else if (raw instanceof ArrayBuffer) handleIncomingBinary(raw);
+      else if (raw instanceof Blob) raw.arrayBuffer().then(handleIncomingBinary).catch(() => {});
+    } catch (_) {}
+  };
 
-  // ===================================================================
-  // 2. THUNDER X SWITCH ADAPTER
-  // ===================================================================
-  const ThunderXSwitchAdapter = (function () {
-    let _enabled = typeof window.THUNDER_X_SWITCH_STATE === "boolean"
-      ? window.THUNDER_X_SWITCH_STATE
-      : true;
+  const noteSocket = (url) => {
+    try {
+      const u = String(url).split("?")[0];
+      if (state.sockets.indexOf(u) < 0) {
+        state.sockets.push(u);
+        if (state.sockets.length > 5) state.sockets.shift();
+      }
+    } catch (_) {}
+  };
 
-    const _listeners = new Set();
+  /* --- ট্রেড বন্ধ (s_orders/close) — আসল জয়ের profit পড়ে orb দেখানো --- */
+  const CLOSED_MAX = 500;
+  const closedDeals = new Set();
+  /** socket → placeholder-এর পরে আসা binary frame কোন event-এর */
+  const binQueue = new WeakMap();
 
-    function setEnabled(val, source) {
-      const next = Boolean(val);
-      if (_enabled === next) return;
-      _enabled = next;
-      window.THUNDER_X_SWITCH_STATE = _enabled;
+  const onOrdersClosed = (d) => {
+    if (!d || !Array.isArray(d.deals)) return;
+    let won = 0;
+    for (const deal of d.deals) {
+      if (!deal || deal.id == null) continue;
+      const id = String(deal.id);
+      if (closedDeals.has(id)) continue;
+      closedDeals.add(id);
+      if (closedDeals.size > CLOSED_MAX) closedDeals.delete(closedDeals.values().next().value);
+      const profit = Number(deal.profit);
+      if (isFinite(profit) && profit > 0.004) won += profit;
+    }
+    if (won > 0) showProfitOrb(Math.round(won * 1e4) / 1e4);
+  };
 
-      _listeners.forEach((fn) => {
-        try { fn(_enabled); } catch (e) { console.error(e); }
-      });
+  const trackDeals = (ws, raw) => {
+    if (typeof raw === "string") {
+      const ph = /^45(\d+)-(?:\/[^,]*,)?\d*\["([^"]+)"/.exec(raw);
+      if (ph) {
+        let q = binQueue.get(ws);
+        if (!q) binQueue.set(ws, (q = []));
+        for (let i = 0; i < Number(ph[1]); i++) q.push(ph[2]);
+        return;
+      }
+      if (raw.indexOf("s_orders/close") < 0) return;
+      const msg = parseSocketIoText(raw);
+      if (msg && msg.event === "s_orders/close") onOrdersClosed(msg.data);
+      return;
+    }
+    if (!(raw instanceof ArrayBuffer)) return;
+    const q = binQueue.get(ws);
+    const ev = q && q.length ? q.shift() : null;
+    if (ev !== "s_orders/close") return;
+    const bytes = new Uint8Array(raw);
+    const off = bytes.length && bytes[0] < 10 ? 1 : 0;
+    try {
+      onOrdersClosed(JSON.parse(decoder.decode(bytes.subarray(off))));
+    } catch (_) {}
+  };
 
-      if (source !== "event") {
+  /* --- হুক: চালু থাকা socket-ও ধরতে MessageEvent.data + send প্যাচ করি --- */
+  const PROC = Symbol("qxProcessed");
+  const nativeDataDesc = Object.getOwnPropertyDescriptor(MessageEvent.prototype, "data");
+  const nativeGetData = nativeDataDesc.get;
+
+  Object.defineProperty(MessageEvent.prototype, "data", {
+    configurable: true,
+    enumerable: nativeDataDesc.enumerable,
+    get() {
+      const raw = nativeGetData.call(this);
+      // শুধু WebSocket থেকে আসা message ধরি (postMessage/worker বাদ)
+      const tgt = this.currentTarget || this.target;
+      if (!(tgt instanceof WebSocket) || !qxEngineLive) return raw;
+      if (!this[PROC]) {
+        this[PROC] = true;
+        noteSocket(tgt.url);
+        trackState(raw);
         try {
-          window.dispatchEvent(
-            new CustomEvent("THUNDER_X_SWITCH", {
-              detail: { enabled: _enabled }
-            })
-          );
+          trackDeals(tgt, raw);
         } catch (_) {}
       }
-    }
-
-    function isEnabled() {
-      return _enabled;
-    }
-
-    function subscribe(fn) {
-      _listeners.add(fn);
-      return () => _listeners.delete(fn);
-    }
-
-    window.addEventListener("THUNDER_X_SWITCH", function (e) {
-      if (e && e.detail && typeof e.detail.enabled === "boolean") {
-        setEnabled(e.detail.enabled, "event");
-      }
-    });
-
-    return {
-      setEnabled,
-      isEnabled,
-      subscribe,
-    };
-  })();
-
-  window.ThunderXSwitchAdapter = ThunderXSwitchAdapter;
-  window.THUNDER_X_SWITCH_STATE = ThunderXSwitchAdapter.isEnabled();
-
-  // ===================================================================
-  // 3. SERVER-SIDE LICENSE VERIFICATION ENGINE
-  // ===================================================================
-  async function activateLicenseKey(rawKey) {
-    const key = String(rawKey || "").trim().toUpperCase();
-    if (!key) return { success: false, message: "Please enter your license key." };
-
-    const result = await callServerEndpoint("/api/license/activate", "POST", {
-      licenseKey: key,
-      key: key,
-      hwid: CURRENT_HWID,
-      deviceId: CURRENT_HWID,
-      botType: BRAND_TITLE,
-      userAgent: navigator.userAgent,
-      deviceLabel: `${navigator.platform || "Web"} Browser`,
-    });
-
-    if (result.ok && result.data && result.data.success) {
-      localStorage.setItem(LIC_STORAGE_KEY, key);
-      if (result.data.license) {
-        cachedLicenseData = result.data.license;
-        try { localStorage.setItem(LIC_INFO_STORAGE, JSON.stringify(result.data.license)); } catch (_) {}
-      }
-      startHeartbeatTimer(key);
-      return { success: true, license: result.data.license };
-    }
-
-    if (result.data && result.data.message) {
-      return { success: false, message: result.data.message };
-    }
-
-    if (result.message && !result.networkError) {
-      return { success: false, message: result.message };
-    }
-
-    // Offline fallback: if previously validated key matches
-    const saved = localStorage.getItem(LIC_STORAGE_KEY);
-    if (saved && saved.toUpperCase() === key && cachedLicenseData) {
-      return { success: true, license: cachedLicenseData, offline: true };
-    }
-
-    return {
-      success: false,
-      message: result.message || "Server connection failed. Please check network.",
-      networkError: result.networkError,
-    };
-  }
-
-  async function validateExistingLicense() {
-    const savedKey = localStorage.getItem(LIC_STORAGE_KEY);
-    if (!savedKey) return false;
-
-    const result = await callServerEndpoint("/api/license/verify", "POST", {
-      licenseKey: savedKey,
-      key: savedKey,
-      hwid: CURRENT_HWID,
-      deviceId: CURRENT_HWID,
-      botType: BRAND_TITLE,
-      userAgent: navigator.userAgent,
-    });
-
-    if (result.ok && result.data && (result.data.state === "ACTIVE" || result.data.status === "ACTIVE")) {
-      if (result.data.license) {
-        cachedLicenseData = result.data.license;
-        try { localStorage.setItem(LIC_INFO_STORAGE, JSON.stringify(result.data.license)); } catch (_) {}
-      }
-      startHeartbeatTimer(savedKey);
-      return true;
-    }
-    return Boolean(cachedLicenseData);
-  }
-
-  // Periodic heartbeat timer
-  let heartbeatInterval = null;
-  function startHeartbeatTimer(key) {
-    if (heartbeatInterval) clearInterval(heartbeatInterval);
-    heartbeatInterval = setInterval(async () => {
-      try {
-        await callServerEndpoint("/api/license/heartbeat", "POST", {
-          licenseKey: key,
-          key: key,
-          hwid: CURRENT_HWID,
-          botType: BRAND_TITLE,
-        });
-      } catch (_) {}
-    }, 60000);
-  }
-
-  // Record trade usage on server
-  async function reportLicenseUsage(side, asset) {
-    const key = localStorage.getItem(LIC_STORAGE_KEY);
-    if (!key) return { allowed: false };
-
-    const result = await callServerEndpoint("/api/license/use", "POST", {
-      licenseKey: key,
-      key: key,
-      hwid: CURRENT_HWID,
-      botType: BRAND_TITLE,
-      action: "TRADE",
-      side,
-      asset,
-    });
-
-    if (result.ok && result.data && result.data.allowed) {
-      if (cachedLicenseData) {
-        cachedLicenseData.todayUsage = result.data.todayUsage;
-        cachedLicenseData.currentUsage = result.data.currentUsage;
-      }
-      return result.data;
-    }
-
-    if (result.data && result.data.message) {
-      showLicenseToast(result.data.message);
-      return { allowed: false, message: result.data.message };
-    }
-
-    return { allowed: true };
-  }
-
-  function showLicenseToast(msg) {
-    const toast = document.createElement("div");
-    toast.style.cssText = "position:fixed;top:20px;left:50%;transform:translateX(-50%);z-index:2147483647;background:rgba(239,68,68,0.92);color:#fff;padding:12px 22px;border-radius:10px;font:700 13px system-ui,sans-serif;box-shadow:0 10px 25px rgba(0,0,0,0.5);letter-spacing:0.04em;";
-    toast.textContent = msg;
-    document.body.appendChild(toast);
-    setTimeout(() => toast.remove(), 4000);
-  }
-
-  // ===================================================================
-  // 4. QUOTEX TE LICENSE ACTIVATION GATE MODAL
-  // ===================================================================
-  function showLicenseGate(onSuccess) {
-    const existingOverlay = document.getElementById("qte-license-overlay");
-    if (existingOverlay) existingOverlay.remove();
-    const existingStyle = document.getElementById("qte-license-style");
-    if (existingStyle) existingStyle.remove();
-
-    const styleEl = document.createElement("style");
-    styleEl.id = "qte-license-style";
-    styleEl.textContent = `
-      #qte-license-overlay {
-        position: fixed;
-        inset: 0;
-        z-index: 2147483647;
-        display: flex;
-        align-items: center;
-        justify-content: center;
-        background: radial-gradient(circle at center, rgba(14, 25, 58, 0.92), rgba(3, 7, 18, 0.96));
-        backdrop-filter: blur(10px);
-        -webkit-backdrop-filter: blur(10px);
-        font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif;
-      }
-      #qte-license-box {
-        position: relative;
-        width: min(390px, calc(100vw - 28px));
-        padding: 26px 24px 22px;
-        border-radius: 20px;
-        background: radial-gradient(120% 80% at 50% -10%, rgba(37, 99, 235, 0.45), transparent 70%), linear-gradient(165deg, #09172e 0%, #030712 100%);
-        border: 1.5px solid rgba(56, 189, 248, 0.55);
-        box-shadow: 0 0 60px rgba(37, 99, 235, 0.4), 0 20px 50px rgba(0, 0, 0, 0.8);
-        color: #e6eefc;
-        box-sizing: border-box;
-      }
-      .qte-header {
-        display: flex;
-        flex-direction: column;
-        align-items: center;
-        gap: 8px;
-        margin-bottom: 18px;
-      }
-      .qte-avatar {
-        width: 64px;
-        height: 64px;
-        border-radius: 18px;
-        overflow: hidden;
-        border: 2px solid #38bdf8;
-        box-shadow: 0 0 24px rgba(56, 189, 248, 0.55);
-        background: #020617;
-      }
-      .qte-avatar img {
-        width: 100%;
-        height: 100%;
-        object-fit: cover;
-      }
-      .qte-title {
-        font-size: 21px;
-        font-weight: 800;
-        color: #e0f2fe;
-        letter-spacing: 0.1em;
-        text-shadow: 0 0 14px rgba(56, 189, 248, 0.7);
-        margin: 0;
-      }
-      .qte-msg {
-        font-size: 12px;
-        color: #93c5fd;
-        margin: 0;
-        letter-spacing: 0.06em;
-        text-transform: uppercase;
-        font-weight: 700;
-      }
-      .qte-hwid-badge {
-        display: flex;
-        align-items: center;
-        justify-content: space-between;
-        padding: 7px 11px;
-        background: rgba(2, 6, 23, 0.7);
-        border: 1px dashed rgba(56, 189, 248, 0.35);
-        border-radius: 9px;
-        font-size: 11px;
-        color: #94a3b8;
-        margin-top: 4px;
-        font-family: monospace;
-      }
-      .qte-hwid-val {
-        color: #38bdf8;
-        font-weight: 700;
-      }
-      .qte-input-wrap {
-        position: relative;
-        width: 100%;
-        margin-top: 14px;
-      }
-      #qte-lic-input {
-        box-sizing: border-box;
-        width: 100%;
-        padding: 13px 14px;
-        border-radius: 12px;
-        border: 1.5px solid rgba(56, 189, 248, 0.4);
-        background: rgba(2, 6, 23, 0.85);
-        color: #ffffff;
-        font-size: 15px;
-        font-family: "JetBrains Mono", Consolas, monospace;
-        letter-spacing: 0.12em;
-        text-transform: uppercase;
-        outline: none;
-        transition: all 0.2s;
-        text-align: center;
-      }
-      #qte-lic-input:focus {
-        border-color: #38bdf8;
-        box-shadow: 0 0 0 3px rgba(56, 189, 248, 0.25);
-      }
-      #qte-activate-btn {
-        width: 100%;
-        margin-top: 16px;
-        padding: 13px 0;
-        border-radius: 12px;
-        border: 1px solid rgba(255, 255, 255, 0.25);
-        background: linear-gradient(135deg, #0284c7 0%, #2563eb 50%, #4f46e5 100%);
-        color: #ffffff;
-        font-size: 13.5px;
-        font-weight: 800;
-        letter-spacing: 0.1em;
-        text-transform: uppercase;
-        cursor: pointer;
-        box-shadow: 0 0 20px rgba(37, 99, 235, 0.5), inset 0 1px 0 rgba(255, 255, 255, 0.35);
-        transition: transform 0.12s, filter 0.15s;
-      }
-      #qte-activate-btn:hover {
-        filter: brightness(1.15);
-        transform: translateY(-1px);
-      }
-      #qte-activate-btn:disabled {
-        opacity: 0.5;
-        cursor: not-allowed;
-      }
-      #qte-lic-error {
-        margin: 12px 0 0;
-        min-height: 18px;
-        font-size: 12px;
-        font-weight: 600;
-        color: #f87171;
-        text-align: center;
-        letter-spacing: 0.03em;
-      }
-      .qte-server-row {
-        margin-top: 10px;
-        padding: 6px 10px;
-        border-radius: 8px;
-        background: rgba(15, 23, 42, 0.7);
-        border: 1px solid rgba(56, 189, 248, 0.2);
-        display: flex;
-        align-items: center;
-        justify-content: space-between;
-        font-size: 10.5px;
-        color: #94a3b8;
-      }
-      .qte-server-left {
-        display: flex;
-        align-items: center;
-        gap: 6px;
-        overflow: hidden;
-        text-overflow: ellipsis;
-        white-space: nowrap;
-      }
-      .qte-server-dot {
-        width: 7px;
-        height: 7px;
-        border-radius: 50%;
-        background: #eab308;
-        display: inline-block;
-        flex-shrink: 0;
-      }
-      .qte-server-dot.connected {
-        background: #10b981;
-        box-shadow: 0 0 8px #10b981;
-      }
-      .qte-server-dot.error {
-        background: #ef4444;
-      }
-      .qte-server-change-btn {
-        background: transparent;
-        border: none;
-        color: #38bdf8;
-        font-size: 10.5px;
-        font-weight: 700;
-        cursor: pointer;
-        padding: 0;
-        text-decoration: underline;
-        margin-left: 6px;
-        flex-shrink: 0;
-      }
-      .qte-footer-links {
-        margin-top: 12px;
-        display: flex;
-        justify-content: space-between;
-        align-items: center;
-        font-size: 11px;
-        color: #64748b;
-      }
-      .qte-demo-key-btn {
-        background: transparent;
-        border: none;
-        color: #38bdf8;
-        cursor: pointer;
-        padding: 0;
-        font-size: 11px;
-        font-weight: 700;
-        text-decoration: underline;
-      }
-    `;
-    document.head.appendChild(styleEl);
-
-    const savedKey = localStorage.getItem(LIC_STORAGE_KEY) || "";
-
-    const overlay = document.createElement("div");
-    overlay.id = "qte-license-overlay";
-    overlay.innerHTML = `
-      <div id="qte-license-box">
-        <div class="qte-header">
-          <div class="qte-avatar">
-            <img src="${BRAND_LOGO}" alt="${BRAND_TITLE}" onerror="this.src='https://i.postimg.cc/yxNphdfJ/file-000000008d1481fbb8752033356f882f.png'" />
-          </div>
-          <h3 class="qte-title">${BRAND_TITLE}</h3>
-          <p class="qte-msg">International License Activation</p>
-        </div>
-
-        <div class="qte-hwid-badge">
-          <span>Device ID</span>
-          <span class="qte-hwid-val">${CURRENT_HWID}</span>
-        </div>
-
-        <div class="qte-server-row">
-          <div class="qte-server-left">
-            <span class="qte-server-dot" id="qte-server-dot"></span>
-            <span id="qte-server-host">Checking server connection...</span>
-          </div>
-          <button type="button" class="qte-server-change-btn" id="qte-change-server-btn">Change</button>
-        </div>
-
-        <div class="qte-input-wrap">
-          <input id="qte-lic-input" type="text" maxlength="24" spellcheck="false" placeholder="TE-XXXX-XXXX-XXXX-XXXX" value="${savedKey}" />
-        </div>
-
-        <button type="button" id="qte-activate-btn">ACTIVATE LICENSE</button>
-        <p id="qte-lic-error"></p>
-
-        <div class="qte-footer-links">
-          <span>Hardware Bound</span>
-          <button type="button" class="qte-demo-key-btn" id="qte-use-vip-key">Paste VIP Key</button>
-        </div>
-      </div>
-    `;
-    document.body.appendChild(overlay);
-
-    const inputEl = overlay.querySelector("#qte-lic-input");
-    const errorEl = overlay.querySelector("#qte-lic-error");
-    const activateBtn = overlay.querySelector("#qte-activate-btn");
-    const vipKeyBtn = overlay.querySelector("#qte-use-vip-key");
-    const serverDot = overlay.querySelector("#qte-server-dot");
-    const serverHostText = overlay.querySelector("#qte-server-host");
-    const changeServerBtn = overlay.querySelector("#qte-change-server-btn");
-
-    async function updateServerStatusDisplay() {
-      const candidates = getServerCandidateOrigins();
-      const current = SERVER_ORIGIN || candidates[0] || (location.origin ? location.origin : "Auto");
-      serverHostText.textContent = `Server: ${current.replace(/^https?:\/\//, "") || "Local"}`;
-      
-      const ping = await pingServer();
-      if (ping.ok) {
-        serverDot.className = "qte-server-dot connected";
-        serverHostText.textContent = `Online: ${SERVER_ORIGIN ? SERVER_ORIGIN.replace(/^https?:\/\//, "") : "Direct Host"}`;
-      } else {
-        serverDot.className = "qte-server-dot error";
-        serverHostText.textContent = `Server Offline: ${SERVER_ORIGIN ? SERVER_ORIGIN.replace(/^https?:\/\//, "") : "Not Reachable"}`;
-      }
-    }
-    updateServerStatusDisplay();
-
-    changeServerBtn.addEventListener("click", () => {
-      const current = localStorage.getItem(SERVER_URL_STORAGE) || SERVER_ORIGIN || "";
-      const customUrl = prompt("Enter Quotex TE License Server URL (e.g. https://your-domain.run.app):", current);
-      if (customUrl !== null) {
-        const trimmed = customUrl.trim().replace(/\/+$/, "");
-        if (trimmed) {
-          localStorage.setItem(SERVER_URL_STORAGE, trimmed);
-          SERVER_ORIGIN = trimmed;
-        } else {
-          localStorage.removeItem(SERVER_URL_STORAGE);
-          SERVER_ORIGIN = "";
-        }
-        updateServerStatusDisplay();
-      }
-    });
-
-    inputEl.addEventListener("input", () => {
-      let val = inputEl.value.toUpperCase().replace(/[^A-Z0-9]/g, "");
-      if (val.startsWith("TE")) {
-        val = val.slice(2);
-      }
-      let formatted = "TE";
-      for (let i = 0; i < val.length && i < 16; i++) {
-        if (i % 4 === 0) formatted += "-";
-        formatted += val[i];
-      }
-      if (val.length === 0) formatted = "";
-      inputEl.value = formatted;
-    });
-
-    vipKeyBtn.addEventListener("click", () => {
-      inputEl.value = "TE-VIP8-9999-ABCD-2026";
-      errorEl.textContent = "";
-    });
-
-    let isActivating = false;
-
-    async function handleActivation() {
-      if (isActivating) return;
-      const key = inputEl.value.trim();
-      if (!key) {
-        errorEl.textContent = "Please enter your license key.";
-        inputEl.focus();
-        return;
-      }
-
-      isActivating = true;
-      activateBtn.disabled = true;
-      activateBtn.textContent = "VERIFYING WITH SERVER...";
-      errorEl.textContent = "";
-
-      const res = await activateLicenseKey(key);
-
-      isActivating = false;
-      activateBtn.disabled = false;
-      activateBtn.textContent = "ACTIVATE LICENSE";
-
-      if (res.success) {
-        overlay.remove();
-        styleEl.remove();
-        onSuccess();
-      } else {
-        errorEl.textContent = res.message || "License activation rejected.";
-        if (res.networkError) {
-          serverDot.className = "qte-server-dot error";
-          errorEl.innerHTML = `${res.message} <button type="button" class="qte-demo-key-btn" id="qte-fix-srv-btn" style="display:inline;margin-left:4px;">Configure Server URL</button>`;
-          const fixBtn = errorEl.querySelector("#qte-fix-srv-btn");
-          if (fixBtn) {
-            fixBtn.addEventListener("click", () => changeServerBtn.click());
-          }
-        }
-        inputEl.focus();
-      }
-    }
-
-    activateBtn.addEventListener("click", handleActivation);
-    inputEl.addEventListener("keydown", (e) => {
-      if (e.key === "Enter") {
-        e.preventDefault();
-        handleActivation();
-      }
-    });
-
-    setTimeout(() => inputEl.focus(), 80);
-  }
-
-  // ===================================================================
-  // 5. QUOTEX TE CORE LOGIC (ROUND CONTROL + WEBSOCKET TRACKING)
-  // ===================================================================
-  function startQuotexTE() {
-    const STORE_KEY = "qxte_round_ui";
-    const decoder = new TextDecoder();
-
-    const state = {
-      asset: null,
-      assetSource: null,
-      period: 60,
-      periodSource: null,
-      serverOffset: 0,
-      lastTick: null,
-      candle: null,
-      history: [],
-      ticks: 0,
-      events: {},
-      sockets: [],
-    };
-
-    // Fake candle controller
-    const fake = {
-      active: false,
-      target: null,
-      seconds: 5,
-      startPrice: null,
-      startAt: 0,
-      holdOffset: null,
-    };
-
-    const startFake = (target, seconds) => {
-      if (!ThunderXSwitchAdapter.isEnabled()) {
-        console.warn("[Quotex TE] Controller execution blocked: Thunder X Switch is OFF.");
-        return;
-      }
-      fake.active = true;
-      fake.target = Number(target);
-      fake.seconds = Math.max(0.2, Number(seconds) || 5);
-      fake.startPrice = state.lastTick ? state.lastTick.price : null;
-      fake.startAt = Date.now() / 1000;
-      fake.holdOffset = null;
-
-      // Report usage to license backend
-      reportLicenseUsage("SIGNAL", state.asset || "EUR/USD");
-    };
-
-    const stopFake = () => {
-      fake.active = false;
-      fake.startPrice = null;
-      fake.holdOffset = null;
-    };
-
-    // WebSocket Hook
-    const OrigWS = window.WebSocket;
-    if (OrigWS && !OrigWS.__qteHooked) {
-      function ProxiedWebSocket(...args) {
-        const ws = new OrigWS(...args);
-        state.sockets.push(ws);
-
-        const emit = (raw) => {
-          let text = null;
-          if (typeof raw === "string") text = raw;
-          else if (raw instanceof ArrayBuffer) text = decoder.decode(raw);
-          else if (ArrayBuffer.isView(raw)) text = decoder.decode(raw.buffer);
-          if (!text) return;
-
-          let data;
-          try {
-            data = JSON.parse(text);
-          } catch (_) {
-            return;
-          }
-
-          if (data && typeof data === "object") {
-            if (data.asset) state.asset = data.asset;
-            if (data.period) state.period = data.period;
-            if (data.ticks) state.ticks += 1;
-          }
-        };
-
-        ws.addEventListener("message", (e) => emit(e.data));
-        return ws;
-      }
-
-      ProxiedWebSocket.prototype = OrigWS.prototype;
-      ProxiedWebSocket.__qteHooked = true;
-      try {
-        window.WebSocket = ProxiedWebSocket;
-      } catch (_) {}
-    }
-
-    let uiRound = { fakeTarget: null, fakeSeconds: 5 };
-    try {
-      const saved = JSON.parse(localStorage.getItem(STORE_KEY) || "null");
-      if (saved && typeof saved === "object") uiRound = { ...uiRound, ...saved };
-    } catch (_) {}
-
-    function saveRoundUi() {
-      try {
-        localStorage.setItem(STORE_KEY, JSON.stringify(uiRound));
-      } catch (_) {}
-    }
-
-    let fakeRunning = false;
-
-    // UI Host Container
-    const host = document.createElement("div");
-    host.id = "qte-round-controller";
-    const root = host.attachShadow ? host.attachShadow({ mode: "open" }) : host;
-
-    root.innerHTML = `
-      <style>
-        :host {
-          all: initial;
-          font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif;
-          -webkit-user-select: none;
-          user-select: none;
-        }
-        * { box-sizing: border-box; }
-        .fab {
-          position: fixed; z-index: 2147483646; width: 66px; height: 66px; cursor: pointer;
-          touch-action: none; transition: transform .18s cubic-bezier(.2,0,0,1), filter .2s;
-        }
-        .fab:hover { transform: scale(1.06); }
-        .fab.away { opacity: 0; pointer-events: none; transform: scale(.6); }
-        .frame {
-          position: absolute; inset: 0; border-radius: 20px; padding: 2px;
-          background: linear-gradient(135deg, rgba(56,189,248,.85), rgba(37,99,235,.9), rgba(59,130,246,.4));
-          box-shadow: 0 0 25px rgba(37,99,235,.45), 0 10px 25px rgba(0,0,0,.6);
-        }
-        .tile {
-          position: relative; width: 100%; height: 100%; border-radius: 18px;
-          background: radial-gradient(circle at 30% 25%, #0d1b38, #050b1a 80%);
-          display: flex; align-items: center; justify-content: center; overflow: hidden;
-        }
-        .tile img { width: 44px; height: 44px; border-radius: 12px; object-fit: cover; pointer-events: none; }
-        .plate {
-          position: absolute; left: 50%; bottom: -8px; transform: translateX(-50%);
-          background: #0284c7; color: #fff; font-size: 9px; font-weight: 800;
-          padding: 2px 7px; border-radius: 6px; letter-spacing: .08em;
-          box-shadow: 0 2px 8px rgba(0,0,0,.45);
-        }
-
-        .panel {
-          position: fixed; z-index: 2147483647; width: 330px;
-          background: radial-gradient(120% 80% at 50% -10%, rgba(37,99,235,.35), transparent 70%), linear-gradient(165deg, #09172e 0%, #030712 100%);
-          border: 1.5px solid rgba(56,189,248,.5); border-radius: 20px;
-          box-shadow: 0 0 50px rgba(37,99,235,.35), 0 20px 40px rgba(0,0,0,.7);
-          color: #e6eefc; overflow: hidden;
-        }
-        .head {
-          display: flex; align-items: center; gap: 10px; padding: 12px 14px;
-          background: rgba(2,6,23,.5); border-bottom: 1px solid rgba(56,189,248,.2); cursor: move;
-        }
-        .mini { width: 32px; height: 32px; border-radius: 10px; border: 1.5px solid #38bdf8; overflow: hidden; flex-shrink: 0; cursor: pointer; }
-        .mini img { width: 100%; height: 100%; object-fit: cover; }
-        .ttl { font-size: 14px; font-weight: 800; color: #f0f9ff; letter-spacing: .06em; margin: 0; }
-        .sub { font-size: 10px; color: #7dd3fc; letter-spacing: .08em; margin: 0; font-weight: 700; }
-        .chip {
-          margin-left: auto; font-size: 9px; font-weight: 800; letter-spacing: .08em;
-          padding: 3px 8px; border-radius: 6px; background: rgba(56,189,248,.2); color: #38bdf8;
-          border: 1px solid rgba(56,189,248,.4);
-        }
-        .chip.live { background: rgba(52,211,153,.2); color: #34d399; border-color: rgba(52,211,153,.4); }
-
-        .body { padding: 14px; }
-        .card { background: rgba(2,6,23,.6); border: 1px solid rgba(56,189,248,.25); border-radius: 12px; padding: 10px 12px; margin-bottom: 10px; }
-        .line { display: flex; align-items: center; justify-content: space-between; gap: 8px; }
-        .market { flex: 1; min-width: 0; font-weight: 800; font-size: 13.5px; color: #7dd3fc; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
-        
-        .lic-info-box {
-          background: rgba(14, 25, 58, 0.65);
-          border: 1px solid rgba(56, 189, 248, 0.35);
-          border-radius: 10px;
-          padding: 8px 10px;
-          margin-bottom: 12px;
-          font-size: 11px;
-        }
-        .lic-row { display: flex; justify-content: space-between; margin-bottom: 3px; }
-        .lic-k { color: #94a3b8; font-weight: 600; }
-        .lic-v { color: #38bdf8; font-weight: 700; font-family: monospace; }
-        .lic-badge { background: #059669; color: #fff; padding: 1px 6px; border-radius: 4px; font-size: 9px; font-weight: 800; }
-
-        label { position: relative; display: block; margin: 8px 0 4px; color: #8ea0bf; font-size: 11px; font-weight: 700; }
-        input.round-in {
-          position: relative; width: 100%; color: #e6eefc; font: 13px Segoe UI, sans-serif;
-          padding: 8px 10px; border-radius: 10px; background: rgba(2,6,23,.65); border: 1px solid rgba(96,165,250,.24); outline: none;
-        }
-        input.round-in:focus { border-color: #38bdf8; box-shadow: 0 0 0 3px rgba(56,189,248,.18); }
-        .btn-row { display: flex; gap: 8px; margin-top: 12px; }
-        .btn-row button {
-          flex: 1; font: 800 12px Segoe UI, sans-serif; letter-spacing: .08em; text-transform: uppercase;
-          cursor: pointer; padding: 10px 0; border-radius: 10px;
-        }
-        .btn-row .start {
-          color: #fff; border: 1px solid rgba(255,255,255,.18); background: linear-gradient(135deg, #2563eb, #06b6d4);
-          box-shadow: 0 4px 14px rgba(37,99,235,.4);
-        }
-        .btn-row .stop { color: #fca5a5; background: rgba(239,68,68,.1); border: 1px solid rgba(248,113,113,.45); }
-        .btn-row button:disabled { opacity: .35; cursor: default; }
-
-        .switch-box {
-          margin-top: 10px; padding: 9px 11px; border-radius: 10px; background: rgba(14, 25, 58, 0.6);
-          border: 1px solid rgba(56, 189, 248, 0.3); display: flex; align-items: center; justify-content: space-between;
-        }
-        .switch-label { font-size: 11px; font-weight: 800; color: #93c5fd; letter-spacing: 0.06em; text-transform: uppercase; }
-        .switch-toggle-btn {
-          padding: 5px 12px; border-radius: 7px; font-size: 10.5px; font-weight: 800; letter-spacing: 0.08em;
-          border: none; cursor: pointer; text-transform: uppercase; transition: all 0.2s;
-        }
-        .switch-toggle-btn.is-on { background: #34d399; color: #052e1c; box-shadow: 0 0 10px rgba(52, 211, 153, 0.5); }
-        .switch-toggle-btn.is-off { background: #ef4444; color: #ffffff; box-shadow: 0 0 10px rgba(239, 68, 68, 0.4); }
-
-        .switch-to-tx-btn {
-          width: 100%; margin-top: 8px; padding: 10px; border-radius: 10px;
-          background: linear-gradient(135deg, #047857, #059669); border: 1px solid #34d399;
-          color: #fff; font: 800 11.5px Segoe UI, sans-serif; letter-spacing: 0.08em; cursor: pointer;
-          text-transform: uppercase; box-shadow: 0 0 12px rgba(52,211,153,0.35); transition: filter 0.15s;
-        }
-        .switch-to-tx-btn:hover { filter: brightness(1.15); }
-      </style>
-
-      <div class="fab" title="${BRAND_TITLE}">
-        <div class="frame">
-          <div class="tile">
-            <img src="${BRAND_LOGO}" alt="${BRAND_SHORT}" draggable="false" />
-          </div>
-        </div>
-        <div class="plate"><span class="name">${BRAND_SHORT}</span></div>
-      </div>
-
-      <div class="panel" hidden>
-        <div class="head">
-          <div class="mini" title="Minimize">
-            <img src="${BRAND_LOGO}" alt="${BRAND_SHORT}" draggable="false" />
-          </div>
-          <div>
-            <div class="ttl">${BRAND_TITLE}</div>
-            <div class="sub">ROUND CONTROL</div>
-          </div>
-          <span class="chip">ACTIVE</span>
-        </div>
-        <div class="body"></div>
-      </div>
-    `;
-
-    const $ = (sel) => root.querySelector(sel);
-    const fab = $(".fab");
-    const panel = $(".panel");
-    const body = $(".body");
-    const chip = $(".chip");
-    const head = $(".head");
-    const mini = $(".mini");
-
-    function fmtAsset(a) {
-      if (!a) return "EUR/USD (Default)";
-      const otc = /_otc$/i.test(a);
-      const name = a.replace(/_otc$/i, "");
-      const formatted = /^[A-Z]{6}$/.test(name) ? name.slice(0, 3) + "/" + name.slice(3) : name;
-      return otc ? formatted + " (OTC)" : formatted;
-    }
-
-    function renderActive() {
-      body.innerHTML = "";
-      const isSwitchOn = ThunderXSwitchAdapter.isEnabled();
-
-      chip.classList.toggle("live", isSwitchOn);
-      chip.textContent = isSwitchOn ? "LIVE" : "DISABLED";
-
-      const savedKey = localStorage.getItem(LIC_STORAGE_KEY) || "TE-VIP8-****-2026";
-      const licBox = document.createElement("div");
-      licBox.className = "lic-info-box";
-      licBox.innerHTML = `
-        <div class="lic-row">
-          <span class="lic-k">License Key</span>
-          <span class="lic-v">${savedKey.slice(0, 7)}...${savedKey.slice(-4)}</span>
-        </div>
-        <div class="lic-row">
-          <span class="lic-k">Plan / Status</span>
-          <div>
-            <span class="lic-badge">${cachedLicenseData?.planTier || "VIP"}</span>
-            <span style="color:#34d399;font-weight:700;font-size:10px;margin-left:4px;">ACTIVE</span>
-          </div>
-        </div>
-        <div class="lic-row">
-          <span class="lic-k">Device HWID</span>
-          <span class="lic-v" style="font-size:10px;">${CURRENT_HWID}</span>
-        </div>
-        <div style="display:flex;justify-content:flex-end;margin-top:6px;">
-          <button type="button" id="qte-change-lic-btn" style="background:transparent;border:none;color:#38bdf8;font-size:10px;font-weight:700;cursor:pointer;text-decoration:underline;">Switch / Re-enter License</button>
-        </div>
-      `;
-      body.appendChild(licBox);
-
-      licBox.querySelector("#qte-change-lic-btn").addEventListener("click", () => {
-        closePanel();
-        showLicenseGate(renderActive);
-      });
-
-      const card = document.createElement("div");
-      card.className = "card";
-      card.innerHTML = `
-        <div class="line">
-          <span style="font-size:10.5px;font-weight:800;color:#94a3b8;letter-spacing:.08em;">MARKET</span>
-          <span style="font-size:9px;font-weight:800;color:${fakeRunning && isSwitchOn ? "#34d399" : "#94a3b8"};">
-            ${fakeRunning && isSwitchOn ? "● RUNNING" : "● IDLE"}
-          </span>
-        </div>
-        <div class="line" style="margin-top:4px;">
-          <div class="market">${fmtAsset(state.asset)}</div>
-        </div>
-      `;
-      body.appendChild(card);
-
-      const targetLabel = document.createElement("label");
-      targetLabel.textContent = "Round Target Price";
-      body.appendChild(targetLabel);
-
-      const fTarget = document.createElement("input");
-      fTarget.className = "round-in f-target";
-      fTarget.type = "number";
-      fTarget.step = "any";
-      fTarget.placeholder = "e.g. 1.2345";
-      fTarget.value = uiRound.fakeTarget == null ? "" : String(uiRound.fakeTarget);
-      fTarget.disabled = !isSwitchOn;
-      body.appendChild(fTarget);
-
-      const secLabel = document.createElement("label");
-      secLabel.textContent = "Duration (seconds)";
-      body.appendChild(secLabel);
-
-      const fSec = document.createElement("input");
-      fSec.className = "round-in f-sec";
-      fSec.type = "number";
-      fSec.step = "1";
-      fSec.min = "1";
-      fSec.placeholder = "5";
-      fSec.value = uiRound.fakeSeconds == null ? "" : String(uiRound.fakeSeconds);
-      fSec.disabled = !isSwitchOn;
-      body.appendChild(fSec);
-
-      const btns = document.createElement("div");
-      btns.className = "btn-row";
-      const startBtn = document.createElement("button");
-      startBtn.type = "button";
-      startBtn.className = "start";
-      startBtn.textContent = "Start";
-      startBtn.disabled = fakeRunning || !isSwitchOn;
-
-      const stopBtn = document.createElement("button");
-      stopBtn.type = "button";
-      stopBtn.className = "stop";
-      stopBtn.textContent = "Stop";
-      stopBtn.disabled = !fakeRunning || !isSwitchOn;
-
-      btns.appendChild(startBtn);
-      btns.appendChild(stopBtn);
-      body.appendChild(btns);
-
-      const switchBox = document.createElement("div");
-      switchBox.className = "switch-box";
-      switchBox.innerHTML = `
-        <span class="switch-label">⚡ Thunder X Switch</span>
-        <button type="button" class="switch-toggle-btn ${isSwitchOn ? "is-on" : "is-off"}">
-          ${isSwitchOn ? "ON" : "OFF"}
-        </button>
-      `;
-      body.appendChild(switchBox);
-
-      const toggleBtn = switchBox.querySelector(".switch-toggle-btn");
-      toggleBtn.addEventListener("click", () => {
-        const nextState = !ThunderXSwitchAdapter.isEnabled();
-        ThunderXSwitchAdapter.setEnabled(nextState, "ui");
-        renderActive();
-      });
-
-      const switchBotBtn = document.createElement("button");
-      switchBotBtn.type = "button";
-      switchBotBtn.className = "switch-to-tx-btn";
-      switchBotBtn.textContent = "⚡ SWITCH TO THUNDER X";
-      switchBotBtn.addEventListener("click", () => {
-        closePanel();
-        if (typeof window.switchBot === "function") {
-          window.switchBot("THUNDER_X");
-        } else {
-          host.remove();
-          delete window.__QUOTEX_TE_INITIALIZED__;
-          if (typeof window.__initThunderX__ === "function") {
-            window.__initThunderX__();
-          } else {
-            const s = document.createElement("script");
-            s.src = `${SERVER_ORIGIN || ""}/thunderx.js?t=${Date.now()}`;
-            document.body.appendChild(s);
-          }
-        }
-      });
-      body.appendChild(switchBotBtn);
-
-      fTarget.addEventListener("input", function () {
-        uiRound.fakeTarget = fTarget.value;
-        saveRoundUi();
-        if (fakeRunning) startFake(uiRound.fakeTarget, uiRound.fakeSeconds);
-      });
-
-      fSec.addEventListener("input", function () {
-        uiRound.fakeSeconds = fSec.value;
-        saveRoundUi();
-        if (fakeRunning) fake.seconds = Math.max(0.2, Number(uiRound.fakeSeconds) || 5);
-      });
-
-      startBtn.addEventListener("click", function () {
-        if (fakeRunning || !ThunderXSwitchAdapter.isEnabled()) return;
-        const t = Number(uiRound.fakeTarget);
-        if (!uiRound.fakeTarget || !isFinite(t)) {
-          fTarget.focus();
-          return;
-        }
-        fakeRunning = true;
-        startFake(uiRound.fakeTarget, uiRound.fakeSeconds);
-        renderActive();
-      });
-
-      stopBtn.addEventListener("click", function () {
-        if (!fakeRunning) return;
-        fakeRunning = false;
-        stopFake();
-        renderActive();
-      });
-    }
-
-    ThunderXSwitchAdapter.subscribe((enabled) => {
-      if (!enabled && fakeRunning) {
-        fakeRunning = false;
-        stopFake();
-      }
-      renderActive();
-    });
-
-    let pos = { x: window.innerWidth - 96, y: 120 };
-    try {
-      const savedPos = JSON.parse(localStorage.getItem("qte_pos") || "null");
-      if (savedPos && typeof savedPos.x === "number") pos = savedPos;
-    } catch (_) {}
-
-    function place(left, top) {
-      pos.x = Math.max(8, Math.min(left, window.innerWidth - 96));
-      pos.y = Math.max(8, Math.min(top, window.innerHeight - 120));
-      fab.style.left = `${pos.x}px`;
-      fab.style.top = `${pos.y}px`;
-
-      if (panel.hidden) return;
-      const width = panel.offsetWidth || 330;
-      const height = panel.offsetHeight || 380;
-      let panelLeft = pos.x;
-      let panelTop = pos.y + 76;
-
-      if (panelTop + height > window.innerHeight - 8) panelTop = pos.y - height - 12;
-      if (panelTop < 8) panelTop = 8;
-      if (panelLeft + width > window.innerWidth - 8) panelLeft = window.innerWidth - width - 8;
-      if (panelLeft < 8) panelLeft = 8;
-
-      panel.style.left = `${panelLeft}px`;
-      panel.style.top = `${panelTop}px`;
-    }
-
-    function openPanel() {
-      renderActive();
-      panel.hidden = false;
-      place(pos.x, pos.y);
-      fab.classList.add("away");
-    }
-
-    function closePanel() {
-      panel.hidden = true;
-      fab.classList.remove("away");
-    }
-
-    let drag = null;
-    let panelDrag = null;
-
-    fab.addEventListener("pointerdown", function (event) {
-      if (event.button) return;
-      event.preventDefault();
-      drag = { id: event.pointerId, x: event.clientX, y: event.clientY, ox: pos.x, oy: pos.y, moved: false };
-    });
-
-    head.addEventListener("pointerdown", function (event) {
-      if (event.button || panel.hidden) return;
-      event.preventDefault();
-      panelDrag = { id: event.pointerId, x: event.clientX, y: event.clientY, ox: pos.x, oy: pos.y, moved: false, target: event.target };
-    });
-
-    window.addEventListener("pointermove", function (event) {
-      if (panelDrag && event.pointerId === panelDrag.id) {
-        const pdx = event.clientX - panelDrag.x;
-        const pdy = event.clientY - panelDrag.y;
-        if (!panelDrag.moved && Math.hypot(pdx, pdy) < 4) return;
-        panelDrag.moved = true;
-        place(panelDrag.ox + pdx, panelDrag.oy + pdy);
-        return;
-      }
-      if (!drag || event.pointerId !== drag.id) return;
-      const dx = event.clientX - drag.x;
-      const dy = event.clientY - drag.y;
-      if (!drag.moved && Math.hypot(dx, dy) < 4) return;
-      drag.moved = true;
-      place(drag.ox + dx, drag.oy + dy);
-    }, true);
-
-    window.addEventListener("pointerup", function (event) {
-      if (panelDrag && event.pointerId === panelDrag.id) {
-        const moved = panelDrag.moved;
-        const target = panelDrag.target;
-        panelDrag = null;
-        if (moved) {
-          try { localStorage.setItem("qte_pos", JSON.stringify(pos)); } catch (_) {}
-          return;
-        }
-        if (mini && mini.contains(target)) closePanel();
-        return;
-      }
-      if (!drag || event.pointerId !== drag.id) return;
-      const moved = drag.moved;
-      drag = null;
-      if (moved) {
-        try { localStorage.setItem("qte_pos", JSON.stringify(pos)); } catch (_) {}
-        return;
-      }
-      if (!panel.hidden) closePanel();
-      else openPanel();
-    }, true);
-
-    mini.addEventListener("click", closePanel);
-    document.body.appendChild(host);
-    place(pos.x, pos.y);
-
-    console.log("[Quotex TE] Initialized successfully with International License Protection and Thunder X Switch.");
-  }
-
-  // ===================================================================
-  // 6. INITIALIZATION SEQUENCE
-  // ===================================================================
-  validateExistingLicense().then((isValid) => {
-    if (isValid) {
-      startQuotexTE();
-    } else {
-      showLicenseGate(startQuotexTE);
-    }
+      return raw;
+    },
   });
+
+  const nativeSend = WebSocket.prototype.send;
+  WebSocket.prototype.send = function (data) {
+    try {
+      handleOutgoing(data);
+    } catch (_) {}
+    return nativeSend.apply(this, arguments);
+  };
+
+  // ভবিষ্যতে খোলা নতুন socket-ও যেন তালিকায় আসে
+  const NativeWS = window.WebSocket;
+  const HookedWS = new Proxy(NativeWS, {
+    construct(target, args) {
+      const ws = new target(...args);
+      noteSocket(args[0]);
+      return ws;
+    },
+  });
+  window.WebSocket = HookedWS;
+
+  /* ===================================================================
+     অংশ ২ — UI প্যানেল (Shadow DOM)
+     =================================================================== */
+
+  const APP_TITLE = "QUOTEX ZR PRO";
+  const SITE_ORIGIN = "https://quotexzrpro.netlify.app";
+  const LOGO_URL = SITE_ORIGIN + "/logo-256.png";
+
+  /* ===================================================================
+     অংশ ১.৫ — কোনো Trader ID / License Verification নেই
+     -------------------------------------------------------------------
+     এই সংস্করণ শুধু market/socket data পর্যবেক্ষণ করে।
+     Buy/Sell বাটনে কোনো listener বা বাধা যোগ করা হয় না।
+     =================================================================== */
+
+  const DEFAULT_CANDLE_SECONDS = 5;
+  // পপআপের রঙ — সাইটের লোগোর রঙে। RGB মানগুলো "r, g, b" আকারে (rgba-তে ব্যবহারের জন্য)।
+  const THEME = {
+    accent: "30, 144, 255",
+    accent2: "56, 189, 248",
+    accent3: "29, 78, 216",
+    cardTop: "10, 26, 64",
+    cardBottom: "3, 8, 24",
+    overlay: "2, 6, 18",
+    field: "2, 14, 36",
+    text: "#eaf4ff",
+    title: "#ffffff, #7dd3fc 50%, #3b9bff",
+    label: "#5cc8ff",
+    sub: "#7a8fb0",
+    hint: "#8fb0d6",
+    button: "#38bdf8, #1e90ff 50%, #1d4ed8",
+    buttonText: "#ffffff",
+  };
+
+  let ui = {
+    candleSeconds: DEFAULT_CANDLE_SECONDS,
+  };
+
+  const loadUi = () => {
+    try {
+      const raw = localStorage.getItem(STORE_KEY);
+      if (raw) ui = { ...ui, ...JSON.parse(raw) };
+    } catch (_) {}
+  };
+  const save = () => {
+    try {
+      localStorage.setItem(STORE_KEY, JSON.stringify(ui));
+    } catch (_) {}
+  };
+
+  const old = document.getElementById("qx-candle-round-host");
+  if (old) old.remove();
+
+  const host = document.createElement("div");
+  host.id = "qx-candle-round-host";
+  const root = host.attachShadow({ mode: "open" });
+  root.innerHTML = `
+    <style>
+      @import url("https://fonts.googleapis.com/css2?family=Orbitron:wght@600;700;800&family=Sora:wght@400;500;600;700&display=swap");
+      :host { all: initial; }
+      .pro-overlay {
+        --a: ${THEME.accent}; --a2: ${THEME.accent2}; --a3: ${THEME.accent3};
+        --card1: ${THEME.cardTop}; --card2: ${THEME.cardBottom}; --ov: ${THEME.overlay}; --fld: ${THEME.field};
+      }
+      * { box-sizing: border-box; }
+      @keyframes proPulse {
+        0%, 100% { opacity: .45; transform: scale(1); }
+        50% { opacity: .85; transform: scale(1.03); }
+      }
+      @keyframes proScan {
+        0% { transform: translateX(-120%) rotate(12deg); }
+        100% { transform: translateX(220%) rotate(12deg); }
+      }
+      .pro-overlay {
+        position: fixed; inset: 0; z-index: 2147483647;
+        display: flex; align-items: center; justify-content: center; padding: 20px;
+        background: radial-gradient(ellipse 80% 60% at 50% 0%, rgba(var(--a), .18), transparent 55%),
+          radial-gradient(ellipse 60% 50% at 80% 100%, rgba(var(--a3), .12), transparent 50%),
+          rgba(var(--ov), .88);
+        backdrop-filter: blur(14px);
+        font-family: "Sora", system-ui, sans-serif;
+        transition: opacity .35s ease, visibility .35s ease;
+      }
+      .pro-overlay.out { opacity: 0; visibility: hidden; pointer-events: none; }
+      .pro-card {
+        position: relative; width: min(100%, 380px); padding: 28px 26px 24px;
+        border-radius: 22px; overflow: hidden; text-align: center; color: ${THEME.text};
+        border: 1.5px solid transparent;
+        background: linear-gradient(165deg, rgba(var(--card1), .97) 0%, rgba(var(--card2), .98) 100%) padding-box,
+          linear-gradient(135deg, rgb(var(--a)), rgb(var(--a2)) 50%, rgb(var(--a3))) border-box;
+        box-shadow: 0 0 0 1px rgba(255,255,255,.04) inset,
+          0 24px 80px rgba(0, 0, 0, .55),
+          0 0 48px rgba(var(--a), .22);
+      }
+      .pro-card::before {
+        content: ""; position: absolute; inset: -40%; pointer-events: none;
+        background: linear-gradient(105deg, transparent 40%, rgba(var(--a), .08) 50%, transparent 60%);
+        animation: proScan 4.5s ease-in-out infinite;
+      }
+      .pro-ring {
+        position: absolute; top: -60px; left: 50%; width: 200px; height: 200px;
+        margin-left: -100px; border-radius: 50%;
+        border: 1px solid rgba(var(--a), .25);
+        box-shadow: 0 0 40px rgba(var(--a), .2);
+        animation: proPulse 3s ease-in-out infinite;
+      }
+      .pro-logo {
+        position: relative; width: 88px; height: 88px; margin: 0 auto 12px;
+        border-radius: 50%; object-fit: cover;
+        border: 2px solid rgba(var(--a), .6);
+        box-shadow: 0 0 0 4px rgba(var(--a), .1), 0 0 24px rgba(var(--a), .45);
+      }
+      .pro-title {
+        position: relative; margin: 0;
+        font: 800 1.15rem/1.2 "Orbitron", sans-serif;
+        letter-spacing: .06em; text-transform: uppercase;
+        background: linear-gradient(90deg, ${THEME.title});
+        -webkit-background-clip: text; background-clip: text; color: transparent;
+        text-shadow: 0 0 30px rgba(var(--a), .3);
+      }
+      .pro-sub {
+        position: relative; margin: 6px 0 22px; font-size: 12px; color: ${THEME.sub};
+        letter-spacing: .04em;
+      }
+      .pro-step { position: relative; text-align: left; }
+      .pro-step[hidden] { display: none; }
+      .pro-label {
+        display: block; font-size: 11px; font-weight: 600; text-transform: uppercase;
+        letter-spacing: .08em; color: ${THEME.label}; margin-bottom: 8px;
+      }
+      .pro-hint { font-size: 12px; color: ${THEME.hint}; margin: -4px 0 10px; line-height: 1.45; }
+      .pro-field {
+        width: 100%; height: 48px; padding: 0 14px; border-radius: 12px;
+        border: 1.5px solid rgba(var(--a), .45); background: rgba(var(--fld), .85);
+        color: ${THEME.text}; font-size: 15px; font-family: inherit;
+        font-variant-numeric: tabular-nums;
+        transition: border-color .2s, box-shadow .2s;
+      }
+      .pro-field:focus {
+        outline: none; border-color: rgb(var(--a));
+        box-shadow: 0 0 0 4px rgba(var(--a), .18);
+      }
+      .pro-field::-webkit-outer-spin-button,
+      .pro-field::-webkit-inner-spin-button { -webkit-appearance: none; margin: 0; }
+      .pro-btn {
+        width: 100%; margin-top: 14px; height: 48px; border: none; border-radius: 12px;
+        cursor: pointer; font: 700 14px "Sora", sans-serif; letter-spacing: .04em;
+        color: ${THEME.buttonText};
+        background: linear-gradient(135deg, ${THEME.button});
+        box-shadow: 0 10px 28px rgba(var(--a), .45);
+        transition: transform .15s, filter .15s;
+      }
+      .pro-btn:hover { filter: brightness(1.08); transform: translateY(-1px); }
+      .pro-btn:active { transform: translateY(0); }
+      .pro-err {
+        margin: 10px 0 0; font-size: 12px; color: #fca5a5; text-align: center;
+      }
+      .pro-err[hidden] { display: none; }
+      /* অ্যান্ড্রয়েডে চলমান চার্টের ওপর backdrop-filter ঝলকায় — মোবাইলে blur ছাড়া গাঢ় পর্দা */
+      @media (max-width: 767px), (pointer: coarse) {
+        .pro-overlay { backdrop-filter: none; background-color: rgba(var(--ov), .95); }
+      }
+    </style>
+    <div class="pro-overlay">
+      <div class="pro-card">
+        <div class="pro-ring"></div>
+        <img class="pro-logo" alt="${APP_TITLE}" />
+        <h1 class="pro-title">${APP_TITLE}</h1>
+        <p class="pro-sub">Secure candle engine · access verified</p>
+        <div class="pro-step pro-step-candle">
+          <label class="pro-label">Candle time set</label>
+          <p class="pro-hint">Chart candle interval in seconds (e.g. 5, 10, 60).</p>
+          <input class="pro-field pro-candle" type="number" min="1" max="3600" step="1" placeholder="${DEFAULT_CANDLE_SECONDS}" />
+          <button type="button" class="pro-btn pro-apply">Apply &amp; Save</button>
+          <p class="pro-err pro-err-candle" hidden></p>
+        </div>
+      </div>
+    </div>`;
+
+  const $ = (s) => root.querySelector(s);
+
+  const proLogo = $(".pro-logo");
+  if (proLogo) {
+    proLogo.addEventListener("error", () => {
+      proLogo.style.display = "none";
+    });
+    proLogo.src = LOGO_URL;
+  }
+
+  /* ===================================================================
+     Apple Intelligence / Siri-স্টাইল স্ক্রিন-কিনারার আলো — বট চালু থাকলে
+     -------------------------------------------------------------------
+     চার কিনারায় চারটে সরু ফালি; প্রতিটায় গোলাপি → বেগুনি → নীল → সায়ান →
+     কোরাল রঙের ট্র্যাক ঘড়ির কাঁটার দিকে থামাহীন দৌড়ায়। চলা শুধু transform-এ,
+     জ্বলা-কমা শুধু opacity-তে। ক্লিক আটকায় না; reduced motion-এ খুব ধীর।
+     =================================================================== */
+  const AI_GLOW_ID = "qx-ai-glow";
+  const AI_GLOW_STYLE_ID = "qx-ai-glow-style";
+  const ensureAiGlowStyle = () => {
+    if (document.getElementById(AI_GLOW_STYLE_ID)) return;
+    const st = document.createElement("style");
+    st.id = AI_GLOW_STYLE_ID;
+    const G = "#" + AI_GLOW_ID;
+    const HUES = "#ff3ea5,#b04dff,#2f7bff,#22d3ee,#ff5a6e,#ff3ea5";
+    const FADE = "#000 0%,rgba(0,0,0,.7) 25%,rgba(0,0,0,.3) 60%,transparent 100%";
+    const edge = (cls, dir) =>
+      G + " ." + cls + "{-webkit-mask-image:linear-gradient(" + dir + "," + FADE + ");mask-image:linear-gradient(" + dir + "," + FADE + ")}";
+    st.textContent = [
+      G + "{position:fixed;inset:0;pointer-events:none;z-index:2147483646;opacity:0;" +
+        "transition:opacity .35s ease;contain:strict;--t:clamp(8px,1.4vmin,13px)}",
+      G + ".on{opacity:1}",
+      "@media (pointer:coarse),(max-width:767px){" + G + "{--t:clamp(11px,3vmin,16px)}" + G + " .h{display:none}}",
+      G + " .s{position:absolute;inset:0}",
+      G + " .c{animation:qxAiBreath 3.2s ease-in-out infinite}",
+      G + " .h{--t:clamp(18px,3vmin,28px);filter:blur(5px);animation:qxAiHaze 4.4s ease-in-out infinite}",
+      G + " .s>b{position:absolute;display:block;overflow:hidden}",
+      G + " .t{top:0;left:0;right:0;height:var(--t)}",
+      G + " .b{bottom:0;left:0;right:0;height:var(--t)}",
+      G + " .rt{top:0;bottom:0;right:0;width:var(--t)}",
+      G + " .lf{top:0;bottom:0;left:0;width:var(--t)}",
+      edge("t", "180deg"), edge("b", "0deg"), edge("rt", "270deg"), edge("lf", "90deg"),
+      G + " .s>b>i{position:absolute;display:block;will-change:transform}",
+      G + " .t>i," + G + " .b>i{top:0;bottom:0;left:0;width:200%;" +
+        "background:linear-gradient(90deg," + HUES + ") 0 0/50% 100% repeat-x}",
+      G + " .rt>i," + G + " .lf>i{left:0;right:0;top:0;height:200%;" +
+        "background:linear-gradient(180deg," + HUES + ") 0 0/100% 50% repeat-y}",
+      G + " .t>i{animation:qxAiRunX 6s linear infinite reverse}",
+      G + " .b>i{animation:qxAiRunX 6s linear infinite}",
+      G + " .rt>i{animation:qxAiRunY 6s linear infinite reverse}",
+      G + " .lf>i{animation:qxAiRunY 6s linear infinite}",
+      G + " .h>b>i{animation-duration:9s}",
+      "@keyframes qxAiRunX{from{transform:translateX(0)}to{transform:translateX(-50%)}}",
+      "@keyframes qxAiRunY{from{transform:translateY(0)}to{transform:translateY(-50%)}}",
+      "@keyframes qxAiBreath{0%,100%{opacity:.85}50%{opacity:1}}",
+      "@keyframes qxAiHaze{0%,100%{opacity:.35}50%{opacity:.6}}",
+    ].join("\n");
+    (document.head || document.documentElement).appendChild(st);
+  };
+  const setAiGlow = (on) => {
+    let el = document.getElementById(AI_GLOW_ID);
+    if (!on) {
+      if (el) el.classList.remove("on");
+      return;
+    }
+    ensureAiGlowStyle();
+    if (!el) {
+      el = document.createElement("div");
+      el.id = AI_GLOW_ID;
+      el.setAttribute("aria-hidden", "true");
+      const strips = '<b class="t"><i></i></b><b class="rt"><i></i></b><b class="b"><i></i></b><b class="lf"><i></i></b>';
+      el.innerHTML = '<div class="s h">' + strips + '</div><div class="s c">' + strips + "</div>";
+      document.documentElement.appendChild(el);
+    }
+    requestAnimationFrame(() => el.classList.add("on"));
+  };
+  const removeAiGlow = () => {
+    const el = document.getElementById(AI_GLOW_ID);
+    if (el) el.remove();
+    const st = document.getElementById(AI_GLOW_STYLE_ID);
+    if (st) st.remove();
+  };
+
+  /* ===================================================================
+     Profit হলে স্ক্রিনের মাঝের একটু নিচে সবুজ profit orb + "Profit +$X"
+     -------------------------------------------------------------------
+     চকচকে সবুজ গোলক, ভেতরে সাদা ↑ তীর আস্তে ওঠানামা করে, নিচ থেকে
+     সোনালি কণা উঠে মিলিয়ে যায়, মাঝে মাঝে আলোর ঝলক পার হয়; গোলকটা
+     হৃৎস্পন্দনের মতো ধুকপুক করে, চারপাশে সবুজ/টিল/সোনালি আভা আর রিং।
+     নিচে Inter ফন্টে (Google Fonts) লেখা। লাফিয়ে আসে, ৩ সেকেন্ড থাকে,
+     তারপর ঝলকে উঠে ওপরে ভেসে ছোট হয়ে মিলিয়ে যায়। দেখানোর মাঝে আবার
+     profit এলে লেখা বদলে সময় নতুন করে শুরু।
+     =================================================================== */
+  const ORB_ID = "qx-profit-orb";
+  const ORB_STYLE_ID = "qx-profit-orb-style";
+  const ORB_FONT_ID = "qx-profit-orb-font";
+  const ORB_HOLD_MS = 3000;
+  const ORB_OUT_MS = 600;
+  const ORB_GATHER_MS = 400;
+  let orbTimer = null;
+  let orbOutTimer = null;
+  let orbGatherTimer = null;
+  let orbSum = 0;
+  const ensureOrbStyle = () => {
+    if (!document.getElementById(ORB_FONT_ID)) {
+      const lk = document.createElement("link");
+      lk.id = ORB_FONT_ID;
+      lk.rel = "stylesheet";
+      lk.href = "https://fonts.googleapis.com/css2?family=Inter:wght@500;600;800&display=swap";
+      (document.head || document.documentElement).appendChild(lk);
+    }
+    if (document.getElementById(ORB_STYLE_ID)) return;
+    const O = "#" + ORB_ID;
+    const st = document.createElement("style");
+    st.id = ORB_STYLE_ID;
+    const AMT_GRAD = "#22d3ee,#67e8f9 30%,#a5f3fc 60%,#22d3ee";
+    const T = "translate(-50%,-50%)";
+    st.textContent = [
+      O + "{position:fixed;left:50%;top:60%;z-index:2147483647;pointer-events:none;display:flex;flex-direction:column;" +
+        "align-items:center;gap:clamp(9px,1.8vmin,13px);transform:" + T + " scale(.2);opacity:0;" +
+        "--s:clamp(70px,16vmin,100px);font-family:Inter,-apple-system,BlinkMacSystemFont,'SF Pro Display','Segoe UI',Roboto,sans-serif}",
+      O + ".in{animation:qxOrbIn .8s cubic-bezier(.22,1,.36,1) forwards}",
+      O + ".out{animation:qxOrbOut " + ORB_OUT_MS + "ms cubic-bezier(.55,0,.8,.2) forwards}",
+      O + " .core{position:relative;width:var(--s);height:var(--s)}",
+      O + " .halo{position:absolute;inset:-40%;border-radius:50%;" +
+        "background:radial-gradient(circle,rgba(34,197,94,.55) 0%,rgba(20,184,166,.28) 42%,rgba(251,191,36,.12) 58%,transparent 72%);" +
+        "filter:blur(calc(var(--s)*.12));animation:qxOrbHalo 1.2s ease-in-out infinite alternate}",
+      O + " .rp{position:absolute;inset:0;border-radius:50%;border:2px solid rgba(52,211,153,.75);" +
+        "box-shadow:0 0 16px rgba(34,197,94,.55);opacity:0;animation:qxOrbRipple 2s cubic-bezier(.2,.7,.3,1) infinite}",
+      O + " .rp.r2{border-color:rgba(251,191,36,.7);box-shadow:0 0 16px rgba(251,191,36,.45);animation-delay:1s}",
+      O + " .orb{position:absolute;inset:0;border-radius:50%;overflow:hidden;" +
+        "background:radial-gradient(circle at 34% 28%,#6ee7b7 0%,#10b981 34%,#047857 72%,#064e3b 100%);" +
+        "animation:qxOrbBeat 1.4s ease-in-out infinite,qxOrbGlow 1.4s ease-in-out infinite alternate}",
+      O + " .orb::before{content:'';position:absolute;left:16%;top:8%;width:52%;height:34%;border-radius:50%;" +
+        "background:radial-gradient(ellipse,rgba(255,255,255,.55),rgba(255,255,255,0) 70%)}",
+      O + " .orb::after{content:'';position:absolute;inset:0;border-radius:50%;" +
+        "box-shadow:inset 0 -6px calc(var(--s)*.14) rgba(6,78,59,.6),inset 0 0 0 1px rgba(255,255,255,.18)}",
+      O + " .sh{position:absolute;top:-20%;bottom:-20%;left:-60%;width:40%;transform:skewX(-20deg);" +
+        "background:linear-gradient(90deg,transparent,rgba(255,255,255,.35),transparent);animation:qxOrbSweep 2.4s ease-in-out infinite}",
+      O + " .ic{position:absolute;left:50%;top:50%;width:44%;height:44%;margin:-22% 0 0 -22%;" +
+        "filter:drop-shadow(0 0 6px rgba(251,191,36,.75)) drop-shadow(0 2px 4px rgba(6,78,59,.6));animation:qxOrbBob 1.1s ease-in-out infinite alternate}",
+      O + " .sp{position:absolute;bottom:6%;width:7%;height:7%;border-radius:50%;opacity:0;" +
+        "background:radial-gradient(circle,#fff 0%,#fde68a 45%,rgba(251,191,36,0) 70%);animation:qxOrbRise 1.8s ease-out infinite}",
+      O + " .sp:nth-of-type(1){left:22%;animation-delay:0s}",
+      O + " .sp:nth-of-type(2){left:40%;animation-delay:.45s;width:5%;height:5%}",
+      O + " .sp:nth-of-type(3){left:58%;animation-delay:.9s}",
+      O + " .sp:nth-of-type(4){left:72%;animation-delay:1.3s;width:5%;height:5%}",
+      O + " .sp:nth-of-type(5){left:32%;animation-delay:1.1s;width:4%;height:4%}",
+      O + " .txt{display:flex;flex-direction:column;align-items:center;line-height:1.1;color:#fff;text-align:center;" +
+        "text-shadow:0 2px 16px rgba(34,211,238,.5),0 0 22px rgba(103,232,249,.3);opacity:0}",
+      O + ".in .txt{animation:qxOrbTxt .6s .25s cubic-bezier(.22,1,.36,1) forwards}",
+      O + ".out .txt{opacity:1}",
+      O + " .lbl{font-weight:600;font-size:clamp(10px,1.7vmin,12px);letter-spacing:.2em;text-transform:uppercase;color:#67e8f9;opacity:.95}",
+      O + " .amt{font-weight:800;font-size:clamp(21px,4.6vmin,30px);letter-spacing:-.01em;margin-top:3px;" +
+        "background:linear-gradient(90deg," + AMT_GRAD + ");-webkit-background-clip:text;background-clip:text;" +
+        "-webkit-text-fill-color:transparent;background-size:300% 100%;animation:qxOrbShine 2.4s linear infinite}",
+      "@keyframes qxOrbIn{0%{opacity:0;transform:" + T + " scale(.2);filter:blur(12px)}" +
+        "55%{opacity:1;transform:" + T + " scale(1.14);filter:blur(0)}" +
+        "75%{transform:" + T + " scale(.95)}100%{opacity:1;transform:" + T + " scale(1)}}",
+      "@keyframes qxOrbOut{0%{opacity:1;transform:" + T + " scale(1);filter:blur(0) brightness(1)}" +
+        "30%{opacity:1;transform:" + T + " scale(1.1);filter:blur(0) brightness(1.4)}" +
+        "100%{opacity:0;transform:translate(-50%,-90%) scale(.3);filter:blur(10px) brightness(1)}}",
+      "@keyframes qxOrbTxt{from{opacity:0;transform:translateY(16px)}to{opacity:1;transform:none}}",
+      "@keyframes qxOrbHalo{from{opacity:.55;transform:scale(.9)}to{opacity:1;transform:scale(1.08)}}",
+      "@keyframes qxOrbRipple{0%{opacity:.85;transform:scale(1)}100%{opacity:0;transform:scale(1.9)}}",
+      "@keyframes qxOrbBeat{0%,40%,100%{transform:scale(1)}12%{transform:scale(1.07)}24%{transform:scale(.98)}32%{transform:scale(1.03)}}",
+      "@keyframes qxOrbGlow{from{box-shadow:0 0 calc(var(--s)*.2) rgba(34,197,94,.55),0 0 calc(var(--s)*.45) rgba(20,184,166,.25)}" +
+        "to{box-shadow:0 0 calc(var(--s)*.32) rgba(52,211,153,.7),0 0 calc(var(--s)*.6) rgba(251,191,36,.25)}}",
+      "@keyframes qxOrbSweep{0%,35%{left:-60%}75%,100%{left:130%}}",
+      "@keyframes qxOrbBob{from{transform:translateY(6%)}to{transform:translateY(-8%)}}",
+      "@keyframes qxOrbRise{0%{opacity:0;transform:translateY(0) scale(.6)}20%{opacity:1}100%{opacity:0;transform:translateY(calc(var(--s)*-.75)) scale(1.1)}}",
+      "@keyframes qxOrbShine{to{background-position:-300% 0}}",
+    ].join("\n");
+    (document.head || document.documentElement).appendChild(st);
+  };
+  const fmtProfit = (n) =>
+    "+$" + n.toLocaleString("en-US", { minimumFractionDigits: 2, maximumFractionDigits: 2 });
+  // কাছাকাছি সময়ে বন্ধ হওয়া ট্রেডের profit যোগ হয়ে একটাই orb: প্রথমটার পর
+  // ORB_GATHER_MS অপেক্ষা করে মোট দেখায়; orb দেখানোর মধ্যে আরও এলে মোটে যোগ
+  // হয়ে সময় নতুন করে শুরু। orb সরে যাওয়া শুরু হলে মোট শূন্য থেকে।
+  const showProfitOrb = (amount) => {
+    if (!qxEngineLive || !(amount > 0)) return;
+    orbSum = Math.round((orbSum + amount) * 1e4) / 1e4;
+    const cur = document.getElementById(ORB_ID);
+    if (cur && cur.classList.contains("in")) {
+      renderProfitOrb();
+      return;
+    }
+    if (orbGatherTimer) return;
+    orbGatherTimer = setTimeout(() => {
+      orbGatherTimer = null;
+      renderProfitOrb();
+    }, ORB_GATHER_MS);
+  };
+  const renderProfitOrb = () => {
+    if (!qxEngineLive || !(orbSum > 0)) return;
+    const amount = orbSum;
+    ensureOrbStyle();
+    let el = document.getElementById(ORB_ID);
+    if (!el) {
+      el = document.createElement("div");
+      el.id = ORB_ID;
+      el.setAttribute("aria-live", "polite");
+      el.innerHTML =
+        '<div class="core"><div class="halo"></div><div class="rp"></div><div class="rp r2"></div>' +
+        '<div class="orb"><i class="sh"></i><b class="sp"></b><b class="sp"></b><b class="sp"></b><b class="sp"></b><b class="sp"></b>' +
+        '<svg class="ic" viewBox="0 0 24 24"><path d="M12 19V5M5.5 11.5L12 5l6.5 6.5" fill="none" stroke="#fff" ' +
+        'stroke-width="2.8" stroke-linecap="round" stroke-linejoin="round"/></svg></div></div>' +
+        '<div class="txt"><span class="lbl">Profit</span><span class="amt"></span></div>';
+      document.documentElement.appendChild(el);
+    }
+    el.querySelector(".amt").textContent = fmtProfit(amount);
+    clearTimeout(orbTimer);
+    clearTimeout(orbOutTimer);
+    if (!el.classList.contains("in")) {
+      el.classList.remove("out");
+      void el.offsetWidth;
+      el.classList.add("in");
+    }
+    orbTimer = setTimeout(() => {
+      orbSum = 0;
+      el.classList.remove("in");
+      el.classList.add("out");
+      orbOutTimer = setTimeout(() => el.remove(), ORB_OUT_MS + 50);
+    }, ORB_HOLD_MS);
+  };
+  const removeProfitOrb = () => {
+    clearTimeout(orbTimer);
+    clearTimeout(orbOutTimer);
+    clearTimeout(orbGatherTimer);
+    orbGatherTimer = null;
+    orbSum = 0;
+    for (const id of [ORB_ID, ORB_STYLE_ID, ORB_FONT_ID]) {
+      const n = document.getElementById(id);
+      if (n) n.remove();
+    }
+  };
+
+  const proOverlay = $(".pro-overlay");
+  const proCandle = $(".pro-candle");
+  const proErrCandle = $(".pro-err-candle");
+
+  const finishProSetup = (secRaw) => {
+    const sec = Math.max(1, Math.min(3600, Math.round(Number(secRaw) || DEFAULT_CANDLE_SECONDS)));
+    ui.candleSeconds = sec;
+    setPeriod(sec, "user");
+    save();
+    qxEngineLive = true;
+    setAiGlow(true);
+    if (proOverlay) proOverlay.classList.add("out");
+  };
+
+  const onProApply = () => {
+    const v = proCandle && proCandle.value;
+    if (v == null || v === "" || !isFinite(Number(v)) || Number(v) < 1) {
+      if (proErrCandle) {
+        proErrCandle.hidden = false;
+        proErrCandle.textContent = "Enter a valid candle time (seconds).";
+      }
+      return;
+    }
+    if (proErrCandle) proErrCandle.hidden = true;
+    finishProSetup(v);
+  };
+
+  const proApplyBtn = $(".pro-apply");
+  if (proApplyBtn) proApplyBtn.addEventListener("click", onProApply);
+  if (proCandle) {
+    proCandle.addEventListener("keydown", (e) => {
+      if (e.key === "Enter") onProApply();
+    });
+  }
+
+  loadUi();
+  (document.body || document.documentElement).appendChild(host);
+  if (proCandle) {
+    proCandle.value = String(DEFAULT_CANDLE_SECONDS);
+    setTimeout(() => proCandle.focus(), 30);
+  }
+
+  /* ===================================================================
+     আনইনস্টল
+     =================================================================== */
+  window.qxUninstall = () => {
+    try {
+      removeAiGlow();
+      removeProfitOrb();
+      qxEngineLive = false;
+      Object.defineProperty(MessageEvent.prototype, "data", nativeDataDesc);
+      WebSocket.prototype.send = nativeSend;
+      window.WebSocket = NativeWS;
+      host.remove();
+      delete window.__qxCandleConsole;
+      delete window.qxUninstall;
+    } catch (_) {}
+  };
 })();
